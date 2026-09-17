@@ -1,0 +1,8547 @@
+/* FARO Mail — Contrôleur principal */
+'use strict';
+const App = (() => {
+  const ENGINE = 'ws://127.0.0.1:47800';
+  let rpcToken = '';
+  let ws;
+  let connecting = false;
+  let reconnectTimer = null;
+  let reqId = 0;
+  let shuttingDown = false;
+  let bundledEngineProcess = null;
+  let bundledEngineOwned = false;
+  let bundledEngineLastError = '';
+  let bundledEngineEventsWired = false;
+  let bundledEngineStartupLog = [];
+  let lastProbeFailureDetail = '';
+  const pending = new Map();
+
+  let config = {};
+  let accounts = [];
+  let view = { type: 'unified' };
+  let list;
+  let currentConversation = null;
+  let currentReadTimer = null;
+  let currentMessageToken = 0;
+  let currentLabels = [];
+  let editingAccountId = null;
+  let editingLabelId = null;
+  let pendingLabelDeleteId = null;
+  let currentRules = [];
+  let ruleAccountId = null;
+  let editingRuleId = null;
+  let ruleConditions = [];
+  let pendingRuleDeleteId = null;
+  let activitySequence = 0;
+  let activityEntries = [];
+  let unseenActivityCount = 0;
+  let manualSyncPending = false;
+  const activeSyncActivities = new Map();
+  const activeSyncRunIds = new Map();
+  const activeMaintenanceActivities = new Map();
+  let pendingConfirmAction = null;
+  let backupBusy = false;
+  let bulkSelection = [];
+  let bulkSelectionMeta = { total: 0, allSelected: false };
+  let quickLabelContext = null;
+  let quickLabelRequestToken = 0;
+  let statisticsState = { period: '30d', accountId: '', tab: 'overview' };
+  let statisticsData = null;
+  let statisticsRequestToken = 0;
+  let readerTabs = [];
+  let activeReaderTabKey = 'preview';
+  let previewReaderRow = null;
+  let contactsCache = [];
+  let contactGroups = [];
+  let contactDirectory = new Map();
+  let editingContactId = null;
+  let contactAvatarData = '';
+  let contactPendingNewGroups = new Set();
+  let contactsSearchTimer = null;
+  const contactSuggestionState = new Map();
+  let externalLinkOpening = false;
+  let updateState = { checking: false, latest: '', url: '', available: false, checkedAt: 0, error: '' };
+
+  const LABEL_COLORS = [
+    '#8b7dd8', '#4f8bd6', '#36a3a0', '#49a86b', '#a8a33a',
+    '#d39a3f', '#d66f4f', '#cf5b78', '#9a6cc2', '#687386',
+  ];
+  const DEFAULT_ACCENTS = { dark: '#2FB6C4', light: '#4782D6', sagasser: '#C4362C' };
+  const ACCENT_PRESETS = [
+    { id: 'libra', color: '#A879DA' },
+    { id: 'blue', color: '#4F8BD6' },
+    { id: 'green', color: '#49A86B' },
+    { id: 'purple', color: '#8B7DD8' },
+    { id: 'rose', color: '#CF5B78' },
+    { id: 'red', color: '#D66F4F' },
+  ];
+
+  function startupMessage(text, { error = false } = {}) {
+    const screen = document.getElementById('startup-screen');
+    const message = document.getElementById('startup-message');
+    if (message && text) message.textContent = String(text);
+    if (screen) screen.classList.toggle('error', Boolean(error));
+  }
+
+  function hideStartupScreen() {
+    const screen = document.getElementById('startup-screen');
+    if (!screen) return;
+    screen.classList.add('done');
+    setTimeout(() => screen.remove(), 300);
+  }
+
+  function renderSyncButtonState() {
+    const button = document.getElementById('btn-sync');
+    const menuButton = document.getElementById('btn-sync-menu');
+    if (!button) return;
+    const syncing = manualSyncPending || activeSyncActivities.size > 0;
+
+    // En 0.4.2, la durée de l'animation dépend des événements sync.* réels.
+    // manualSyncPending ne couvre que les quelques millisecondes du RPC de
+    // démarrage et ne peut donc plus rester bloqué sur une promesse réseau.
+    button.disabled = manualSyncPending;
+    if (menuButton) menuButton.disabled = manualSyncPending;
+    button.setAttribute('aria-busy', syncing ? 'true' : 'false');
+    button.classList.toggle('sync-pending', syncing);
+    button.querySelector('i')?.classList.toggle('fa-spin', syncing);
+  }
+
+  function setManualSyncBusy(busy) {
+    manualSyncPending = Boolean(busy);
+    renderSyncButtonState();
+  }
+
+  function syncMenuStrings() {
+    const locale = String(I18N.locale || 'de').toLowerCase();
+    if (locale.startsWith('en')) {
+      return { all: 'All mailboxes', choose: 'Retrieve a mailbox', current: 'Mail retrieval already in progress' };
+    }
+    if (locale.startsWith('de')) {
+      return { all: 'Alle Postfächer', choose: 'Postfach abrufen', current: 'Eine Abholung läuft bereits' };
+    }
+    return { all: 'Toutes les boîtes', choose: 'Relever une boîte', current: 'Une relève est déjà en cours' };
+  }
+
+  function closeSyncMenu() {
+    const menu = document.getElementById('sync-account-menu');
+    const toggle = document.getElementById('btn-sync-menu');
+    menu?.classList.add('hidden');
+    toggle?.setAttribute('aria-expanded', 'false');
+  }
+
+  function renderSyncMenu() {
+    const menu = document.getElementById('sync-account-menu');
+    if (!menu) return;
+    const labels = syncMenuStrings();
+    menu.innerHTML = '';
+
+    const addItem = (label, accountId = null, iconClass = 'fa-solid fa-inbox') => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'sync-account-menu-item';
+      button.setAttribute('role', 'menuitem');
+      button.innerHTML = `<i class="${iconClass}"></i><span>${esc(label)}</span>`;
+      button.onclick = event => {
+        event.stopPropagation();
+        closeSyncMenu();
+        runManualSync(accountId);
+      };
+      menu.appendChild(button);
+    };
+
+    addItem(labels.all, null, 'fa-solid fa-inbox');
+    if (accounts.length) {
+      const separator = document.createElement('div');
+      separator.className = 'sync-account-menu-separator';
+      menu.appendChild(separator);
+    }
+    for (const account of accounts) {
+      addItem(account.displayName || account.email || account.id, account.id, 'fa-regular fa-envelope');
+    }
+  }
+
+  function toggleSyncMenu(event) {
+    event?.stopPropagation?.();
+    const menu = document.getElementById('sync-account-menu');
+    const toggle = document.getElementById('btn-sync-menu');
+    if (!menu || !toggle) return;
+    const opening = menu.classList.contains('hidden');
+    if (!opening) {
+      closeSyncMenu();
+      return;
+    }
+    renderSyncMenu();
+    menu.classList.remove('hidden');
+    toggle.setAttribute('aria-expanded', 'true');
+    toggle.title = syncMenuStrings().choose;
+  }
+
+  async function runManualSync(accountId = null) {
+    if (manualSyncPending) return;
+    closeSyncMenu();
+    setManualSyncBusy(true);
+    status(t('status.syncRequested'), 'busy');
+    try {
+      const result = accountId
+        ? await rpc('sync.start', { accountId })
+        : await rpc('sync.startAll');
+      if (result?.alreadyRunning) {
+        status(syncMenuStrings().current, 'info');
+      }
+    } catch (error) {
+      status(`${t('error')} : ${error.message}`, 'error');
+    } finally {
+      setManualSyncBusy(false);
+    }
+  }
+
+  // ---------- Moteur embarqué Windows ----------
+  function usesBundledWindowsEngine() {
+    return window.NL_OS === 'Windows';
+  }
+
+  async function writeEngineStartupLog(message, { reset = false } = {}) {
+    if (window.NL_OS !== 'Windows') return;
+    try {
+      const appDir = String(window.NL_PATH || '').replace(/[\\/]+$/, '');
+      if (!appDir) return;
+      await Neutralino.filesystem.createDirectory(`${appDir}\\data`).catch(() => {});
+      if (reset) bundledEngineStartupLog = [];
+      const stamp = new Date().toISOString();
+      bundledEngineStartupLog.push(`[${stamp}] ${String(message || '')}`);
+      if (bundledEngineStartupLog.length > 80) bundledEngineStartupLog = bundledEngineStartupLog.slice(-80);
+      await Neutralino.filesystem.writeFile(`${appDir}\\data\\engine-startup.log`, `${bundledEngineStartupLog.join('\n')}\n`);
+    } catch {}
+  }
+
+  // Le moteur écrit un jeton à usage local dans data/engine.token à chaque
+  // démarrage ; l'interface doit le fournir en paramètre de connexion pour
+  // que le serveur WebSocket accepte la requête (voir engine/backend.js).
+  function engineDataPath(filename) {
+    const separator = String(typeof NL_OS === 'undefined' ? '' : NL_OS) === 'Windows' ? '\\' : '/';
+    const base = String(typeof NL_PATH === 'undefined' ? '.' : NL_PATH).replace(/[\\/]+$/, '');
+    return `${base}${separator}data${separator}${filename}`;
+  }
+
+  async function readEngineToken() {
+    try {
+      const raw = await Neutralino.filesystem.readFile(engineDataPath('engine.token'));
+      const token = String(raw || '').trim();
+      return /^[0-9a-f]{64}$/i.test(token) ? token : '';
+    } catch {
+      return '';
+    }
+  }
+
+  function engineUrl() {
+    return rpcToken ? `${ENGINE}/?token=${encodeURIComponent(rpcToken)}` : ENGINE;
+  }
+
+  async function probeEngine(timeout = 300) {
+    // Le jeton ne change pas pendant la durée de vie du processus moteur : une
+    // fois lu avec succès, inutile de relire le fichier à chaque tentative de
+    // la boucle d'attente (I/O disque superflue, sensible sur un disque lent
+    // ou sous surveillance antivirus temps réel).
+    if (!rpcToken) rpcToken = (await readEngineToken()) || rpcToken;
+    return new Promise(resolve => {
+      let settled = false;
+      let probe = null;
+      const finish = value => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try { probe?.close(); } catch {}
+        resolve(value);
+      };
+      const timer = setTimeout(() => {
+        lastProbeFailureDetail = `délai dépassé (${timeout} ms sans réponse)`;
+        finish(false);
+      }, timeout);
+      try {
+        probe = new WebSocket(engineUrl());
+        probe.onopen = () => finish(true);
+        probe.onerror = () => {
+          lastProbeFailureDetail = 'événement "error" sur la WebSocket (connexion refusée ou bloquée)';
+          finish(false);
+        };
+        probe.onclose = event => {
+          lastProbeFailureDetail = `connexion fermée (code ${event?.code ?? '?'}${event?.reason ? `, ${event.reason}` : ''})`;
+          finish(false);
+        };
+      } catch (error) {
+        lastProbeFailureDetail = `exception à la création de la WebSocket : ${error?.message || error}`;
+        finish(false);
+      }
+    });
+  }
+
+  function wireBundledEngineEvents() {
+    if (bundledEngineEventsWired || !usesBundledWindowsEngine()) return;
+    bundledEngineEventsWired = true;
+    try {
+      Neutralino.events.on('spawnedProcess', event => {
+        const detail = event?.detail || {};
+        if (!bundledEngineProcess || Number(detail.id) !== Number(bundledEngineProcess.id)) return;
+        if (detail.action === 'stdErr' && detail.data) {
+          bundledEngineLastError = String(detail.data).trim().slice(-4000);
+          console.error('[FARO Mail moteur]', detail.data);
+          writeEngineStartupLog(`STDERR : ${String(detail.data).trim()}`);
+        } else if (detail.action === 'stdOut' && detail.data) {
+          console.info('[FARO Mail moteur]', detail.data);
+          writeEngineStartupLog(`STDOUT : ${String(detail.data).trim()}`);
+        } else if (detail.action === 'exit') {
+          const wasOwned = bundledEngineOwned;
+          bundledEngineProcess = null;
+          bundledEngineOwned = false;
+          if (wasOwned && !shuttingDown) {
+            setEngine(false);
+            status(`Moteur FARO Mail arrêté (code ${detail.data ?? '?'})`, 'error');
+          }
+        }
+      });
+    } catch (error) {
+      console.warn('[FARO Mail] Événements du moteur Windows indisponibles :', error);
+    }
+  }
+
+  async function ensureBundledWindowsEngine() {
+    if (!usesBundledWindowsEngine()) return;
+    startupMessage(t('startup.engineInit'));
+    wireBundledEngineEvents();
+
+    // Une instance précédente peut déjà fournir le moteur. Dans ce cas, cette
+    // fenêtre s'y connecte mais n'en devient pas propriétaire.
+    if (await probeEngine(250)) return;
+
+    const appDir = String(window.NL_PATH || '').replace(/[\\/]+$/, '');
+    if (!appDir || appDir.includes('"')) throw new Error('Chemin d’installation FARO Mail invalide.');
+    const nodeExe = `${appDir}\\runtime\\node\\node.exe`;
+    const engineFile = `${appDir}\\engine\\backend.js`;
+    try {
+      const nodeStats = await Neutralino.filesystem.getStats(nodeExe);
+      const engineStats = await Neutralino.filesystem.getStats(engineFile);
+      if (!nodeStats?.isFile || !engineStats?.isFile) throw new Error('Runtime incomplet');
+    } catch {
+      throw new Error(`Runtime Windows FARO Mail incomplet. Vérifiez ${nodeExe} et ${engineFile}.`);
+    }
+    const parentPid = Number(window.NL_PID || 0);
+    const parentArgument = Number.isInteger(parentPid) && parentPid > 0
+      ? ` --faromail-parent-pid=${parentPid}`
+      : '';
+    const command = `"${nodeExe}" --use-system-ca "${engineFile}"${parentArgument}`;
+
+    bundledEngineLastError = '';
+    await writeEngineStartupLog(`Démarrage : ${command}`, { reset: true });
+    // --use-system-ca ajoute le magasin de certificats Windows aux CA de Node
+    // sans désactiver la validation TLS.
+    startupMessage(t('startup.engineStarting'));
+    bundledEngineProcess = await Neutralino.os.spawnProcess(command, { cwd: appDir });
+    bundledEngineOwned = true;
+
+    // 45 s plutôt que 12 s : au tout premier lancement après installation,
+    // certains antivirus analysent en synchrone le node.exe embarqué
+    // (~90 Mo, encore inconnu de leur réputation cloud) avant de le laisser
+    // s'exécuter, ce qui peut à lui seul dépasser une dizaine de secondes.
+    const deadline = Date.now() + 45000;
+    let lastLoggedProbeAt = 0;
+    while (Date.now() < deadline) {
+      if (await probeEngine(220)) return;
+      if (!bundledEngineProcess) break;
+      const now = Date.now();
+      // Journalise le motif d'échec de connexion toutes les ~5 s (pas à chaque
+      // tentative, pour rester sous la limite de 80 lignes du journal) — cela
+      // permet de distinguer un simple délai réseau d'un refus explicite
+      // (pare-feu, antivirus, contrôle applicatif) lors du diagnostic.
+      if (now - lastLoggedProbeAt >= 5000) {
+        lastLoggedProbeAt = now;
+        await writeEngineStartupLog(`Connexion au moteur : ${lastProbeFailureDetail || 'échec (raison inconnue)'} — nouvelle tentative…`);
+      }
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+
+    const detail = bundledEngineLastError ? `\n\n${bundledEngineLastError}` : '';
+    await writeEngineStartupLog(`ÉCHEC : Le moteur n’a pas répondu dans le délai imparti. Dernier motif de connexion : ${lastProbeFailureDetail || 'inconnu'}.${bundledEngineLastError ? ` ${bundledEngineLastError}` : ''}`);
+    throw new Error(`Le moteur FARO Mail n’a pas pu démarrer.${detail}\n\nConsultez data\\engine-startup.log.\n\nSi c'est le tout premier lancement après installation, un antivirus est peut-être en train d'analyser le moteur : patientez puis relancez FARO Mail.`);
+  }
+
+  async function stopBundledWindowsEngine() {
+    if (!usesBundledWindowsEngine() || !bundledEngineOwned || !bundledEngineProcess?.id) return;
+    const processId = bundledEngineProcess.id;
+    bundledEngineOwned = false;
+    try {
+      await Neutralino.os.updateSpawnedProcess(processId, 'exit');
+    } catch {}
+    bundledEngineProcess = null;
+  }
+
+  // ---------- RPC ----------
+  function scheduleReconnect(delay = 1500) {
+    if (shuttingDown || reconnectTimer) return;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, delay);
+  }
+
+  async function connect() {
+    if (shuttingDown) return;
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+    if (connecting) return;
+    connecting = true;
+    setEngine(false, true);
+    rpcToken = (await readEngineToken()) || rpcToken;
+    try {
+      ws = new WebSocket(engineUrl());
+    } catch (error) {
+      connecting = false;
+      status(`${t('error')} : ${error.message}`, 'error');
+      scheduleReconnect();
+      return;
+    }
+    ws.onopen = async () => {
+      connecting = false;
+      setEngine(true);
+      try { await boot(); }
+      catch (error) {
+        console.error('[FARO Mail] Démarrage de l’interface :', error);
+        startupMessage(`${t('error')} : ${error.message}`, { error: true });
+        status(`${t('error')} : ${error.message}`, 'error');
+      }
+    };
+    ws.onclose = () => {
+      connecting = false;
+      setEngine(false);
+      for (const request of pending.values()) request.reject(new Error(t('status.disconnected')));
+      pending.clear();
+      scheduleReconnect();
+    };
+    ws.onerror = () => {
+      connecting = false;
+      setEngine(false);
+    };
+    ws.onmessage = event => {
+      const message = JSON.parse(event.data);
+      if (message.event) return onEvent(message.event, message.data || {});
+      const request = pending.get(message.id);
+      if (!request) return;
+      pending.delete(message.id);
+      message.ok ? request.resolve(message.result) : request.reject(Object.assign(new Error(message.error), {
+        code: message.errorCode || '',
+        protocol: message.errorProtocol || '',
+        certDetails: message.certDetails || null,
+      }));
+    };
+  }
+
+  function rpc(method, params = {}) {
+    return new Promise((resolve, reject) => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        reject(new Error(t('status.disconnected')));
+        return;
+      }
+      const id = ++reqId;
+      pending.set(id, { resolve, reject });
+      ws.send(JSON.stringify({ id, method, params }));
+    });
+  }
+
+  // Traduit un code d'erreur RPC structuré (réseau/TLS) dans la langue de
+  // l'interface. Repli sur le message brut du moteur si le code est inconnu
+  // ou absent (ex. erreurs métier déjà explicites).
+  const RPC_ERROR_KEYS = {
+    DNS_NOT_FOUND: 'account.error.dnsNotFound',
+    CONNECTION_REFUSED: 'account.error.connectionRefused',
+    TIMEOUT: 'account.error.timeout',
+    CONNECTION_RESET: 'account.error.connectionReset',
+    AUTH_FAILED: 'account.error.authFailed',
+    CERT_UNTRUSTED: 'account.error.certUntrusted',
+  };
+  function translateRpcError(error) {
+    const key = RPC_ERROR_KEYS[error?.code];
+    if (!key) return error?.message || String(error);
+    const label = error.protocol ? String(error.protocol).toUpperCase() + ' : ' : '';
+    return label + t(key);
+  }
+
+  async function waitForEngine({ timeout = 8000 } = {}) {
+    if (ws?.readyState === WebSocket.OPEN) return true;
+    connect();
+    const started = Date.now();
+    while (Date.now() - started < timeout) {
+      if (ws?.readyState === WebSocket.OPEN) return true;
+      await new Promise(resolve => setTimeout(resolve, 120));
+    }
+    throw new Error(t('status.disconnected'));
+  }
+
+  // ---------- Activité et redimensionnement ----------
+  function accountLabel(accountId) {
+    const account = accounts.find(item => item.id === accountId);
+    return account?.displayName || account?.email || t('activity.unknownAccount');
+  }
+
+  function syncSourceLabel(source) {
+    const key = ['manual', 'timer', 'idle', 'startup'].includes(source) ? source : 'manual';
+    return t(`activity.source.${key}`);
+  }
+
+  function activityIcon(entry) {
+    if (entry.kind === 'mail') return 'fa-solid fa-envelope-circle-check';
+    if (entry.state === 'running') return 'fa-solid fa-rotate fa-spin';
+    if (entry.state === 'error') return 'fa-solid fa-triangle-exclamation';
+    if (entry.state === 'cancelled') return 'fa-solid fa-ban';
+    if (entry.state === 'stopping') return 'fa-solid fa-circle-notch fa-spin';
+    return 'fa-solid fa-check';
+  }
+
+  function activityTime(timestamp) {
+    return new Date(timestamp).toLocaleTimeString(I18N.locale || 'de', {
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+    });
+  }
+
+  function renderActivity() {
+    const listElement = document.getElementById('activity-list');
+    const emptyElement = document.getElementById('activity-empty');
+    if (!listElement || !emptyElement) return;
+    listElement.innerHTML = activityEntries.map(entry => `
+      <div class="activity-entry ${esc(entry.state || 'info')}">
+        <span class="activity-entry-icon"><i class="${activityIcon(entry)}"></i></span>
+        <span class="activity-entry-main">
+          <span class="activity-entry-title">${esc(entry.title)}</span>
+          ${entry.detail ? `<span class="activity-entry-detail">${esc(entry.detail)}</span>` : ''}
+        </span>
+        ${entry.kind === 'sync' && entry.state === 'running' && entry.accountId ? `
+          <button class="activity-stop-entry" type="button"
+                  data-stop-sync="${esc(entry.accountId)}" title="${esc(t('activity.stopAccount'))}">
+            <i class="fa-solid fa-stop"></i>
+          </button>` : ''}
+        <time class="activity-entry-time">${esc(activityTime(entry.updatedAt || entry.createdAt))}</time>
+      </div>`).join('');
+    listElement.querySelectorAll('[data-stop-sync]').forEach(button => {
+      button.onclick = event => {
+        event.stopPropagation();
+        stopSync(button.dataset.stopSync || null);
+      };
+    });
+    emptyElement.classList.toggle('hidden', activityEntries.length > 0);
+    listElement.classList.toggle('hidden', activityEntries.length === 0);
+
+    const stopAllButton = document.getElementById('btn-stop-sync');
+    if (stopAllButton) stopAllButton.classList.toggle('hidden', activeSyncActivities.size === 0);
+
+    const counter = document.getElementById('activity-count');
+    if (counter) {
+      counter.textContent = String(Math.min(99, unseenActivityCount));
+      counter.classList.toggle('hidden', unseenActivityCount === 0);
+    }
+    renderSyncButtonState();
+  }
+
+  function addActivity({ kind = 'sync', state = 'info', title, detail = '', key = null, accountId = null }) {
+    const entry = {
+      id: ++activitySequence,
+      kind,
+      state,
+      title,
+      detail,
+      accountId,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    activityEntries.unshift(entry);
+    activityEntries = activityEntries.slice(0, 80);
+    if (key) activeSyncActivities.set(key, entry.id);
+    if (document.getElementById('activity-panel')?.classList.contains('hidden')) unseenActivityCount++;
+    renderActivity();
+    return entry;
+  }
+
+  function updateActivity(id, patch) {
+    const entry = activityEntries.find(item => item.id === id);
+    if (!entry) return null;
+    Object.assign(entry, patch, { updatedAt: Date.now() });
+    renderActivity();
+    return entry;
+  }
+
+  function beginSyncActivity(data) {
+    const key = data.accountId || `batch-${Date.now()}`;
+    const currentRunId = activeSyncRunIds.get(key);
+    if (data.runId && currentRunId && currentRunId !== data.runId) {
+      const previousId = activeSyncActivities.get(key);
+      if (previousId) {
+        updateActivity(previousId, {
+          state: 'cancelled',
+          title: t('activity.syncCancelled', { account: accountLabel(data.accountId) }),
+          detail: t('activity.syncCancelledDetail', { source: syncSourceLabel(data.source) }),
+        });
+      }
+      activeSyncActivities.delete(key);
+    }
+    if (data.runId) activeSyncRunIds.set(key, data.runId);
+
+    const currentId = activeSyncActivities.get(key);
+    const title = t('activity.syncStarted', { account: accountLabel(data.accountId) });
+    const detail = t('activity.syncSource', { source: syncSourceLabel(data.source) });
+    if (currentId) return updateActivity(currentId, { state: 'running', title, detail, accountId: data.accountId });
+    return addActivity({ kind: 'sync', state: 'running', title, detail, key, accountId: data.accountId });
+  }
+
+  function updateSyncActivity(data) {
+    const key = data.accountId;
+    const currentRunId = activeSyncRunIds.get(key);
+    if (data.runId && currentRunId && currentRunId !== data.runId) return;
+
+    // Depuis 0.4.2, une vraie relève possède toujours un runId. Un événement
+    // de progression interne sans relève active ne doit jamais créer à lui
+    // seul une activité "Relever" fantôme.
+    if (!data.runId && !activeSyncActivities.has(key)) return;
+
+    let id = activeSyncActivities.get(key);
+    if (!id) id = beginSyncActivity(data)?.id;
+    if (!id) return;
+    const folder = data.folder || 'INBOX';
+    const count = Number(data.count) || 0;
+    const total = Number(data.total) || 0;
+    let detailKey = 'activity.syncProgress';
+    if (data.phase === 'up-to-date') detailKey = 'activity.syncUpToDate';
+    else if (data.phase === 'changes') detailKey = 'activity.syncChanges';
+    else if (data.phase === 'checking') detailKey = 'activity.syncChecking';
+    else if (data.phase === 'download' && total > 0) detailKey = 'activity.syncDownload';
+    updateActivity(id, {
+      state: 'running',
+      detail: t(detailKey, {
+        folder,
+        count,
+        total,
+        source: syncSourceLabel(data.source),
+      }),
+    });
+  }
+
+  function finishSyncActivity(data, failed = false) {
+    const key = data.accountId;
+    const currentRunId = activeSyncRunIds.get(key);
+    if (data.runId && currentRunId && currentRunId !== data.runId) return;
+
+    let id = activeSyncActivities.get(key);
+    if (!id) {
+      if (data.runId) return;
+      id = beginSyncActivity(data)?.id;
+    }
+    if (!id) return;
+    const account = accountLabel(data.accountId);
+    updateActivity(id, failed ? {
+      state: 'error',
+      title: t('activity.syncFailed', { account }),
+      detail: data.error || t('error'),
+    } : {
+      state: 'success',
+      title: t('activity.syncDone', { account }),
+      detail: t('activity.syncResult', {
+        added: Number(data.added) || 0,
+        changed: Number(data.changed) || 0,
+        removed: Number(data.removed) || 0,
+        source: syncSourceLabel(data.source),
+      }),
+    });
+    activeSyncActivities.delete(key);
+    if (!data.runId || activeSyncRunIds.get(key) === data.runId) activeSyncRunIds.delete(key);
+    renderActivity();
+  }
+
+  function cancelSyncActivity(data) {
+    const key = data.accountId;
+    const currentRunId = activeSyncRunIds.get(key);
+    if (data.runId && currentRunId && currentRunId !== data.runId) return;
+
+    let id = activeSyncActivities.get(key);
+    if (!id) {
+      if (data.runId) return;
+      id = beginSyncActivity(data)?.id;
+    }
+    if (!id) return;
+    const account = accountLabel(data.accountId);
+    updateActivity(id, {
+      state: 'cancelled',
+      title: t('activity.syncCancelled', { account }),
+      detail: t('activity.syncCancelledDetail', { source: syncSourceLabel(data.source) }),
+    });
+    activeSyncActivities.delete(key);
+    if (!data.runId || activeSyncRunIds.get(key) === data.runId) activeSyncRunIds.delete(key);
+    renderActivity();
+  }
+
+  async function stopSync(accountId = null) {
+    const targets = (accountId ? [accountId] : [...activeSyncActivities.keys()])
+      .filter(Boolean)
+      .map(id => ({ accountId: id, runId: activeSyncRunIds.get(id) || null }));
+    const ids = targets
+      .map(target => activeSyncActivities.get(target.accountId))
+      .filter(Boolean);
+
+    for (const id of ids) {
+      updateActivity(id, {
+        state: 'stopping',
+        detail: t('status.syncStopping'),
+      });
+    }
+    renderActivity();
+    setManualSyncBusy(false);
+    status(t('status.syncStopping'), 'busy');
+
+    try {
+      const result = await rpc('sync.cancel', accountId ? { accountId } : {});
+      if (Number(result?.cancelled) <= 0) status(t('status.noSyncToStop'), 'info');
+
+      const delay = Math.max(4200, Number(result?.watchdogMs || 3500) + 700);
+      setTimeout(async () => {
+        try {
+          const state = await rpc('sync.status');
+          const serverRuns = new Map((state?.runs || []).map(run => [String(run.accountId), run.runId]));
+          for (const target of targets) {
+            const id = String(target.accountId);
+            if (activeSyncRunIds.get(id) !== target.runId) continue;
+            if (serverRuns.get(id) === target.runId) continue;
+            cancelSyncActivity({
+              accountId: id,
+              runId: target.runId,
+              source: 'manual',
+              forced: true,
+            });
+          }
+        } catch {}
+      }, delay);
+    } catch (error) {
+      status(error.message, 'error');
+    }
+  }
+
+  function maintenanceLabel(kind) {
+    return t(kind === 'trash' ? 'trash.folder' : 'spam.folder');
+  }
+
+  function beginMaintenanceActivity(data) {
+    const key = `maintenance:${data.kind || 'folder'}`;
+    const entry = addActivity({
+      kind: 'maintenance',
+      state: 'running',
+      title: t('activity.emptyStarted', { folder: maintenanceLabel(data.kind) }),
+      detail: t('activity.emptyCount', { count: Number(data.count) || 0 }),
+    });
+    activeMaintenanceActivities.set(key, entry.id);
+    return entry;
+  }
+
+  function finishMaintenanceActivity(data, failed = false) {
+    const key = `maintenance:${data.kind || 'folder'}`;
+    const id = activeMaintenanceActivities.get(key);
+    if (!id) return;
+    updateActivity(id, failed ? {
+      state: 'error',
+      title: t('activity.emptyFailed', { folder: maintenanceLabel(data.kind) }),
+      detail: data.error || t('error'),
+    } : {
+      state: 'success',
+      title: t('activity.emptyDone', { folder: maintenanceLabel(data.kind) }),
+      detail: t('activity.emptyResult', { count: Number(data.count) || 0 }),
+    });
+    activeMaintenanceActivities.delete(key);
+  }
+
+  function addRetentionActivity(data, failed = false) {
+    addActivity({
+      kind: 'maintenance',
+      state: failed ? 'error' : 'success',
+      title: failed
+        ? t('activity.retentionFailed', { account: accountLabel(data.accountId) })
+        : t('activity.retentionDone', { account: accountLabel(data.accountId) }),
+      detail: failed
+        ? (data.error || t('error'))
+        : t('activity.retentionResult', {
+            count: Number(data.count) || 0,
+            days: Number(data.days) || 0,
+          }),
+    });
+  }
+
+  function toggleActivityPanel(forceOpen = null) {
+    const panel = document.getElementById('activity-panel');
+    const button = document.getElementById('btn-activity');
+    if (!panel || !button) return;
+    const open = forceOpen === null ? panel.classList.contains('hidden') : Boolean(forceOpen);
+    panel.classList.toggle('hidden', !open);
+    button.classList.toggle('active', open);
+    if (open) {
+      unseenActivityCount = 0;
+      renderActivity();
+    }
+  }
+
+  function clearCompletedActivity() {
+    activityEntries = activityEntries.filter(entry => entry.state === 'running');
+    unseenActivityCount = 0;
+    renderActivity();
+  }
+
+  const clamp = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, Number(value) || minimum));
+
+  function applyPaneDimensions() {
+    const app = document.getElementById('app');
+    if (!app) return;
+    const width = Math.max(1000, app.clientWidth || 1000);
+    const sidebarMax = Math.max(180, Math.min(430, width - 680));
+    const sidebarWidth = clamp(config.sidebarWidth || 240, 180, sidebarMax);
+    app.style.setProperty('--sidebar-width', `${Math.round(sidebarWidth)}px`);
+
+    if (app.dataset.layout === 'horizontal') {
+      const availableHeight = Math.max(420, app.clientHeight - 76);
+      const listHeight = clamp(config.listPaneHeight || Math.round(availableHeight * .42), 180, Math.max(180, availableHeight - 220));
+      app.style.setProperty('--list-height', `${Math.round(listHeight)}px`);
+      document.getElementById('resize-list')?.setAttribute('aria-orientation', 'horizontal');
+    } else {
+      const listMax = Math.max(280, width - sidebarWidth - 350);
+      const listWidth = clamp(config.listWidth || 380, 280, Math.min(680, listMax));
+      app.style.setProperty('--list-width', `${Math.round(listWidth)}px`);
+      document.getElementById('resize-list')?.setAttribute('aria-orientation', 'vertical');
+    }
+  }
+
+  function persistPaneDimension(key, value) {
+    const rounded = Math.round(value);
+    config = { ...config, [key]: rounded };
+    rpc('config.set', { [key]: rounded }).then(updated => { config = updated; }).catch(() => {});
+  }
+
+  function paneDimension(type) {
+    const app = document.getElementById('app');
+    if (type === 'sidebar') return Number(config.sidebarWidth) || 240;
+    if (app.dataset.layout === 'horizontal') return Number(config.listPaneHeight) || 330;
+    return Number(config.listWidth) || 380;
+  }
+
+  function setPaneDimension(type, value, persist = false) {
+    const app = document.getElementById('app');
+    const width = Math.max(1000, app.clientWidth || 1000);
+    let key;
+    let normalized;
+    if (type === 'sidebar') {
+      key = 'sidebarWidth';
+      normalized = clamp(value, 180, Math.max(180, Math.min(430, width - 680)));
+    } else if (app.dataset.layout === 'horizontal') {
+      key = 'listPaneHeight';
+      const availableHeight = Math.max(420, app.clientHeight - 76);
+      normalized = clamp(value, 180, Math.max(180, availableHeight - 220));
+    } else {
+      key = 'listWidth';
+      const sidebarWidth = clamp(config.sidebarWidth || 240, 180, Math.max(180, Math.min(430, width - 680)));
+      normalized = clamp(value, 280, Math.min(680, Math.max(280, width - sidebarWidth - 350)));
+    }
+    config = { ...config, [key]: Math.round(normalized) };
+    applyPaneDimensions();
+    if (persist) persistPaneDimension(key, config[key]);
+  }
+
+  function wirePaneResizer(element, type) {
+    if (!element) return;
+    const start = event => {
+      if (event.button !== undefined && event.button !== 0) return;
+      event.preventDefault();
+      const app = document.getElementById('app');
+      const horizontalRows = type === 'list' && app.dataset.layout === 'horizontal';
+      const startPosition = horizontalRows ? event.clientY : event.clientX;
+      const startValue = paneDimension(type);
+      element.classList.add('active');
+      document.body.classList.add('resizing-panes');
+      document.body.classList.toggle('resize-rows', horizontalRows);
+      element.setPointerCapture?.(event.pointerId);
+
+      const move = moveEvent => {
+        const currentPosition = horizontalRows ? moveEvent.clientY : moveEvent.clientX;
+        setPaneDimension(type, startValue + currentPosition - startPosition, false);
+      };
+      const stop = stopEvent => {
+        element.releasePointerCapture?.(stopEvent.pointerId);
+        element.removeEventListener('pointermove', move);
+        element.removeEventListener('pointerup', stop);
+        element.removeEventListener('pointercancel', stop);
+        element.classList.remove('active');
+        document.body.classList.remove('resizing-panes', 'resize-rows');
+        setPaneDimension(type, paneDimension(type), true);
+      };
+      element.addEventListener('pointermove', move);
+      element.addEventListener('pointerup', stop);
+      element.addEventListener('pointercancel', stop);
+    };
+    element.addEventListener('pointerdown', start);
+    element.addEventListener('dblclick', () => {
+      const horizontalRows = type === 'list' && document.getElementById('app').dataset.layout === 'horizontal';
+      setPaneDimension(type, type === 'sidebar' ? 240 : horizontalRows ? 330 : 380, true);
+    });
+    element.addEventListener('keydown', event => {
+      const app = document.getElementById('app');
+      const horizontalRows = type === 'list' && app.dataset.layout === 'horizontal';
+      const negativeKey = horizontalRows ? 'ArrowUp' : 'ArrowLeft';
+      const positiveKey = horizontalRows ? 'ArrowDown' : 'ArrowRight';
+      if (![negativeKey, positiveKey, 'Home'].includes(event.key)) return;
+      event.preventDefault();
+      const next = event.key === 'Home'
+        ? (type === 'sidebar' ? 240 : horizontalRows ? 330 : 380)
+        : paneDimension(type) + (event.key === negativeKey ? -20 : 20);
+      setPaneDimension(type, next, true);
+    });
+  }
+
+  function onEvent(event, data) {
+    window.OutboxUI?.onEngineEvent?.(event, data);
+    window.PlannerUI?.onEngineEvent?.(event, data);
+    if (event === 'sync.started') {
+      beginSyncActivity(data);
+      status(t('status.syncStarting', { account: accountLabel(data.accountId) }), 'busy');
+    } else if (event === 'sync.progress') {
+      updateSyncActivity(data);
+      status(t('status.syncingAccount', {
+        account: accountLabel(data.accountId),
+        folder: data.folder || 'INBOX',
+        count: Number(data.count) || 0,
+      }), 'busy');
+    } else if (event === 'sync.done') {
+      finishSyncActivity(data, false);
+      status(t('status.syncDone', {
+        account: accountLabel(data.accountId),
+        added: Number(data.added) || 0,
+      }), 'success');
+      scheduleSyncUiRefresh();
+    } else if (event === 'mail.new') {
+      addActivity({
+        kind: 'mail', state: 'success',
+        title: t('activity.newMail', { account: accountLabel(data.accountId) }),
+        detail: t('activity.newMailCount', { count: Number(data.added) || 0 }),
+      });
+      status(t('status.newmailAccount', {
+        account: accountLabel(data.accountId),
+        count: Number(data.added) || 0,
+      }), 'success');
+      if (config.newMailNotifications !== false) {
+        const count = Number(data.added) || 0;
+        showToast({
+          icon: 'fa-envelope',
+          title: t('notify.newMailTitle', { count }),
+          message: accountLabel(data.accountId),
+          actionLabel: t('notify.newMailAction'),
+          onAction: () => {
+            const account = accounts.find(item => item.id === data.accountId);
+            if (!account) return;
+            view = { type: 'account', accountId: account.id };
+            document.querySelectorAll('.side-item').forEach(item => item.classList.remove('active'));
+            document.querySelector(`[data-view="account:${account.id}"]`)?.classList.add('active');
+            document.getElementById('list-title').textContent = account.displayName || account.email;
+            updateFolderActionButton();
+            refresh();
+          },
+        });
+      }
+      scheduleSyncUiRefresh();
+    } else if (event === 'sync.cancelled') {
+      cancelSyncActivity(data);
+      status(t('status.syncCancelled', { account: accountLabel(data.accountId) }), 'info');
+    } else if (event === 'sync.error') {
+      finishSyncActivity(data, true);
+      status(t('status.syncError', {
+        account: accountLabel(data.accountId),
+        error: data.error || t('error'),
+      }), 'error');
+    } else if (event === 'folder.empty.started') {
+      beginMaintenanceActivity(data);
+      setCleanupProgress({ kind: data.kind, total: data.count, state: 'busy', indeterminate: true });
+      status(t('status.emptyStarting', { folder: maintenanceLabel(data.kind) }), 'busy');
+    } else if (event === 'folder.empty.progress') {
+      setCleanupProgress({ kind: data.kind, current: data.completed, total: data.total, state: 'busy' });
+    } else if (event === 'folder.empty.done') {
+      finishMaintenanceActivity(data, false);
+      setCleanupProgress({ kind: data.kind, current: data.count, total: data.count, state: 'success' });
+      status(t('status.emptyDone', {
+        folder: maintenanceLabel(data.kind),
+        count: Number(data.count) || 0,
+      }), 'success');
+      refresh();
+    } else if (event === 'folder.empty.error') {
+      finishMaintenanceActivity(data, true);
+      setCleanupProgress({ kind: data.kind, state: 'error', error: data.error || t('error') });
+      status(t('status.emptyFailed', {
+        folder: maintenanceLabel(data.kind),
+        error: data.error || t('error'),
+      }), 'error');
+    } else if (event === 'retention.done') {
+      if (Number(data.count) > 0) addRetentionActivity(data, false);
+      refresh();
+    } else if (event === 'retention.error') {
+      addRetentionActivity(data, true);
+    } else if (event === 'sent.copy.error') {
+      addActivity({
+        kind: 'maintenance', state: 'error',
+        title: t('activity.sentCopyFailed', { account: accountLabel(data.accountId) }),
+        detail: data.error || t('error'),
+      });
+    } else if (event === 'backup.started') {
+      setBackupBusy(true);
+      const label = t(data.kind === 'import' ? 'backup.importing' : 'backup.exporting');
+      setBackupOperationStatus(label, 'busy');
+      setBackupProgress({ label, percent: 0, indeterminate: true, state: 'busy' });
+    } else if (event === 'backup.progress') {
+      updateBackupProgress(data);
+    } else if (event === 'backup.done') {
+      const label = t(data.kind === 'import' ? 'backup.importComplete' : 'backup.exportComplete');
+      setBackupProgress({ label, percent: 100, detail: '', state: 'success' });
+    } else if (event === 'backup.error') {
+      setBackupBusy(false);
+      setBackupProgress({
+        label: t('backup.failed'),
+        percent: null,
+        detail: data.error || t('error'),
+        state: 'error',
+      });
+      setBackupOperationStatus(`${t('error')} : ${data.error || t('error')}`, 'error');
+    } else if (event === 'eml.import.progress') {
+      const completed = Math.max(0, Number(data.completed) || 0);
+      const total = Math.max(0, Number(data.total) || 0);
+      const rawName = String(data.name || '').replace(/\\/g, '/');
+      const name = rawName ? rawName.split('/').pop() : '';
+      setBackupProgress({
+        label: t('emlImport.progress', { completed, total }),
+        percent: total ? (completed / total) * 100 : 0,
+        detail: name ? t('backup.progress.currentFile', { name }) : '',
+        state: 'busy',
+      });
+      setBackupOperationStatus(t('emlImport.progress', { completed, total }), 'busy');
+    } else if (event === 'storage.migration.progress') {
+      status(t('storage.migrationProgress', {
+        current: Number(data.encrypted) || 0,
+        total: Number(data.total) || 0,
+      }), 'busy');
+    } else if (event === 'storage.migration.done') {
+      if (Number(data.mail?.encrypted) > 0 || data.search?.migrated) {
+        status(t('storage.migrationDone'), 'success');
+        refresh().catch(() => {});
+      }
+    } else if (event === 'contacts.changed') {
+      refreshContactsCount().catch(() => {});
+      refreshContactDirectory().then(() => refresh()).catch(() => refresh());
+      if (document.getElementById('contacts-modal')?.classList.contains('open')) {
+        loadContacts({ preserveSelection: true }).catch(() => {});
+      }
+      if (Viewer.current) refreshCurrentCorrespondentContact().catch(() => {});
+      if (Number(data.clearedSpam) > 0) {
+        status(t('contacts.spamCleared', { count: Number(data.clearedSpam) }), 'success');
+        refresh().catch(() => {});
+        refreshSpamStats().catch(() => {});
+      }
+    }
+  }
+
+  // ---------- Démarrage ----------
+  async function boot() {
+    startupMessage(t('startup.loadingConfig'));
+    const state = await rpc('config.get');
+    config = state.config;
+    accounts = state.accounts;
+
+    document.documentElement.dataset.theme = config.theme || 'dark';
+    document.getElementById('app').dataset.layout = config.layout || 'vertical';
+    applyAccentScheme();
+    await I18N.load(config.locale || 'de');
+    startupMessage(t('startup.loading'));
+    applyPaneDimensions();
+    applyAppVersion();
+    applySidebarSectionStates();
+    renderActivity();
+    renderReaderTabs();
+
+    await refreshContactDirectory();
+    renderSidebar();
+    syncListControls();
+    await refresh();
+    await refreshSpamStats();
+    await refreshContactsCount();
+    window.OutboxUI?.refresh?.();
+    window.PlannerUI?.refreshSummary?.();
+    status(t('status.connected'), 'success');
+    hideStartupScreen();
+    checkForUpdates(false).catch(() => {});
+
+    // Une seule relève est demandée lorsque l'interface est réellement prête.
+    // Le moteur protège cette action contre les reconnexions WebSocket.
+    rpc('app.ready').catch(error => {
+      console.error('[FARO Mail] Relève au démarrage :', error);
+      status(`${t('error')} : ${error.message}`, 'error');
+    });
+  }
+
+  // ---------- Panneau latéral ----------
+  const SIDEBAR_SECTIONS = {
+    accounts: {
+      configKey: 'sidebarAccountsCollapsed',
+      headerId: 'accounts-section-header',
+      buttonId: 'btn-toggle-accounts',
+      contentId: 'account-list',
+      labelKey: 'accounts',
+    },
+    labels: {
+      configKey: 'sidebarLabelsCollapsed',
+      headerId: 'labels-section-header',
+      buttonId: 'btn-toggle-labels',
+      contentId: 'label-list',
+      labelKey: 'labels',
+    },
+  };
+
+  function applyAppVersion() {
+    const rawVersion = String(window.NL_APPVERSION || '0.4.3').replace(/^v/i, '');
+    const badge = document.getElementById('app-version');
+    if (badge) {
+      badge.textContent = `v${rawVersion}`;
+      badge.title = t('app.version', { version: rawVersion });
+    }
+    document.title = `FARO Mail ${rawVersion}`;
+  }
+
+  function applySidebarSectionState(name) {
+    const section = SIDEBAR_SECTIONS[name];
+    if (!section) return;
+    const collapsed = config[section.configKey] === true;
+    const header = document.getElementById(section.headerId);
+    const button = document.getElementById(section.buttonId);
+    const content = document.getElementById(section.contentId);
+    header?.classList.toggle('collapsed', collapsed);
+    content?.classList.toggle('collapsed', collapsed);
+    button?.setAttribute('aria-expanded', String(!collapsed));
+    if (button) {
+      const sectionLabel = t(section.labelKey);
+      button.title = t(collapsed ? 'sidebar.expand' : 'sidebar.collapse', { section: sectionLabel });
+    }
+  }
+
+  function applySidebarSectionStates() {
+    applySidebarSectionState('accounts');
+    applySidebarSectionState('labels');
+  }
+
+  async function toggleSidebarSection(name) {
+    const section = SIDEBAR_SECTIONS[name];
+    if (!section) return;
+    const nextCollapsed = config[section.configKey] !== true;
+    config[section.configKey] = nextCollapsed;
+    applySidebarSectionState(name);
+    try {
+      config = await rpc('config.set', { [section.configKey]: nextCollapsed });
+    } catch (error) {
+      config[section.configKey] = !nextCollapsed;
+      applySidebarSectionState(name);
+      status(`${t('error')} : ${error.message}`, 'error');
+    }
+  }
+
+  function providerIconForAccount(account) {
+    const email = String(account?.email || '').toLowerCase();
+    const host = String(account?.imap?.host || account?.smtp?.host || '').toLowerCase();
+    const source = `${email} ${host}`;
+    if (account?.logoData) {
+      return `<span class="account-provider-logo custom"><img src="${esc(account.logoData)}" alt=""></span>`;
+    }
+    if (/gmail|googlemail/.test(source)) return '<span class="account-provider-logo provider-gmail"><i class="fa-brands fa-google"></i></span>';
+    if (/outlook|hotmail|live\.com|office365|microsoft/.test(source)) return '<span class="account-provider-logo provider-outlook"><i class="fa-brands fa-microsoft"></i></span>';
+    if (/yahoo/.test(source)) return '<span class="account-provider-logo provider-yahoo"><i class="fa-brands fa-yahoo"></i></span>';
+    if (/icloud|me\.com|mac\.com/.test(source)) return '<span class="account-provider-logo provider-icloud"><i class="fa-brands fa-apple"></i></span>';
+    if (/proton/.test(source)) return '<span class="account-provider-logo provider-proton"><i class="fa-solid fa-shield-halved"></i></span>';
+    if (/orange|wanadoo/.test(source)) return '<span class="account-provider-logo provider-orange"><i class="fa-solid fa-envelope"></i></span>';
+    if (/laposte\.net/.test(source)) return '<span class="account-provider-logo provider-laposte"><i class="fa-solid fa-envelope"></i></span>';
+    if (/free\.fr/.test(source)) return '<span class="account-provider-logo provider-free"><i class="fa-solid fa-wifi"></i></span>';
+    if (/sfr\.fr/.test(source)) return '<span class="account-provider-logo provider-sfr"><i class="fa-solid fa-envelope"></i></span>';
+    if (/ovh|ovhcloud/.test(source)) return '<span class="account-provider-logo provider-ovh"><i class="fa-solid fa-cloud"></i></span>';
+    const initials = String(account?.displayName || account?.email || '?').trim().slice(0, 2).toUpperCase() || '?';
+    return `<span class="account-provider-logo provider-initials" style="background:${safeColor(account?.color)}">${esc(initials)}</span>`;
+  }
+
+  function renderSidebar() {
+    const element = document.getElementById('account-list');
+    element.innerHTML = '';
+    for (const account of accounts) {
+      const row = document.createElement('div');
+      row.className = 'account-sidebar-row';
+      if (view.type === 'account' && String(view.accountId) === String(account.id)) row.classList.add('active');
+
+      const button = document.createElement('button');
+      button.className = 'side-item';
+      if (view.type === 'account' && String(view.accountId) === String(account.id)) button.classList.add('active');
+      button.dataset.view = 'account:' + account.id;
+      button.innerHTML = `${providerIconForAccount(account)}
+        <span class="account-sidebar-name">${esc(account.displayName || account.email)}</span>
+        ${account.id === config.defaultAccountId
+          ? `<i class="fa-solid fa-star default-star" title="${esc(t('account.default'))}"></i>`
+          : ''}
+        <span class="count account-mail-count" data-count="${esc(account.id)}" aria-live="polite">…</span>`;
+
+      const editButton = document.createElement('button');
+      editButton.className = 'iconbtn account-edit-btn';
+      editButton.type = 'button';
+      editButton.dataset.editAccount = account.id;
+      editButton.title = t('account.edit');
+      editButton.setAttribute('aria-label', t('account.edit'));
+      editButton.innerHTML = '<i class="fa-solid fa-pen-to-square"></i>';
+      editButton.onclick = event => {
+        event.stopPropagation();
+        openAccountEditor(account.id);
+      };
+
+      row.append(button, editButton);
+      element.appendChild(row);
+
+      for (const folder of Array.isArray(account.extraFolders) ? account.extraFolders : []) {
+        const folderRow = document.createElement('div');
+        folderRow.className = 'account-sidebar-row account-folder-row';
+        const folderButton = document.createElement('button');
+        folderButton.className = 'side-item side-item-sub';
+        const active = view.type === 'account' && String(view.accountId) === String(account.id) && view.folder === folder;
+        if (active) folderButton.classList.add('active');
+        folderButton.innerHTML = `<i class="fa-regular fa-folder"></i>
+          <span class="account-sidebar-name">${esc(folder)}</span>
+          <span class="count" data-folder-count-account="${esc(account.id)}" data-folder-count-folder="${esc(folder)}" aria-live="polite">…</span>`;
+        folderButton.onclick = () => {
+          closeQuickLabelMenu();
+          document.querySelectorAll('.side-item').forEach(item => item.classList.remove('active'));
+          folderButton.classList.add('active');
+          view = { type: 'account', accountId: account.id, folder };
+          document.getElementById('list-title').textContent = `${account.displayName || account.email} · ${folder}`;
+          updateFolderActionButton();
+          clearReader();
+          refresh();
+        };
+        folderRow.appendChild(folderButton);
+        element.appendChild(folderRow);
+      }
+    }
+    rpc('labels.list').then(renderLabels).catch(() => {});
+  }
+
+  function renderLabels(labels) {
+    currentLabels = Array.isArray(labels) ? labels : [];
+    const element = document.getElementById('label-list');
+    element.innerHTML = '';
+    for (const label of currentLabels) {
+      const button = document.createElement('button');
+      button.className = 'side-item';
+      button.dataset.labelId = String(label.id);
+      if (view.type === 'label' && String(view.labelId) === String(label.id)) {
+        button.classList.add('active');
+      }
+      const messageCount = Number(label.message_count || 0);
+      button.innerHTML = `<span class="account-dot" style="background:${safeColor(label.color)}"></span>
+        <span class="label-sidebar-name">${esc(label.name)}</span>
+        ${messageCount ? `<span class="count" title="${esc(t('label.messageCount', { count: messageCount }))}">${messageCount}</span>` : ''}`;
+      button.onclick = () => {
+        closeQuickLabelMenu();
+        document.querySelectorAll('.side-item').forEach(item => item.classList.remove('active'));
+        button.classList.add('active');
+        view = { type: 'label', labelId: label.id };
+        document.getElementById('list-title').textContent = label.name;
+        clearReader();
+        refresh();
+      };
+      element.appendChild(button);
+    }
+  }
+
+  // ---------- Liste ----------
+  function listParams() {
+    const params = {
+      folderRole: 'inbox', spam: 0, limit: 500,
+      sortBy: config.sortBy || 'date',
+      sortDirection: config.sortDirection || 'desc',
+    };
+    if (view.type === 'spam') {
+      delete params.folderRole;
+      params.folderRoles = ['inbox', 'junk'];
+      params.spam = 1;
+    } else if (view.type === 'sent') {
+      params.folderRole = 'sent';
+      params.spam = null;
+    } else if (view.type === 'trash') {
+      params.folderRole = 'trash';
+      params.spam = null;
+    } else if (view.type === 'label') {
+      // Une étiquette est transversale : elle peut être appliquée à un message
+      // reçu, envoyé, indésirable ou placé dans la corbeille. Ne pas conserver
+      // ici le filtre par défaut sur la seule boîte de réception.
+      delete params.folderRole;
+      params.spam = null;
+      params.labelId = view.labelId;
+    } else if (view.type === 'account') {
+      params.accountId = view.accountId;
+      if (view.folder) {
+        delete params.folderRole;
+        params.folder = view.folder;
+        params.spam = null;
+      }
+    }
+    return params;
+  }
+
+  function decorateRows(rows) {
+    return (rows || []).map(row => ({
+      ...row,
+      display_mode: row.folder_role === 'sent' ? 'sent' : 'received',
+    }));
+  }
+
+
+  function senderEmailForRow(row) {
+    return String(row?.from_addr || '').trim().toLowerCase();
+  }
+
+  async function hydrateSenderIcons(rows = []) {
+    const targets = (rows || []).filter(row => senderEmailForRow(row) && !row.sender_icon_data && !row.contact_avatar_data);
+    const emails = [...new Set(targets.map(senderEmailForRow))].slice(0, 80);
+    if (!emails.length || !ws || ws.readyState !== WebSocket.OPEN) return;
+    const resolved = await rpc('icons.sender.resolveMany', { emails });
+    let changed = false;
+    for (const row of rows || []) {
+      const info = resolved?.[senderEmailForRow(row)];
+      if (!info) continue;
+      if (info.iconData && row.sender_icon_data !== info.iconData) {
+        row.sender_icon_data = info.iconData;
+        changed = true;
+      }
+      if (info.providerKey && row.sender_icon_source !== `provider:${info.providerKey}`) {
+        row.sender_icon_source = `provider:${info.providerKey}`;
+      }
+    }
+    if (changed && list) list.render(true);
+  }
+
+  function updateFolderActionButton() {
+    const button = document.getElementById('btn-empty-folder');
+    if (!button) return;
+    const supported = view.type === 'spam' || view.type === 'trash';
+    button.classList.toggle('hidden', !supported);
+    if (!supported) return;
+    const trash = view.type === 'trash';
+    button.dataset.kind = trash ? 'trash' : 'spam';
+    button.querySelector('i').className = trash
+      ? 'fa-solid fa-trash-can-arrow-up'
+      : 'fa-solid fa-broom';
+    button.querySelector('span').textContent = t(trash ? 'trash.empty' : 'spam.empty');
+    button.title = t(trash ? 'trash.empty' : 'spam.empty');
+  }
+
+  function mailListOptions(preserveListState = false) {
+    return {
+      groupByDate: config.groupByDate !== false && (config.sortBy || 'date') === 'date',
+      preserveExpansion: preserveListState,
+      preservePosition: preserveListState,
+      preserveActive: preserveListState,
+      preserveSelection: preserveListState,
+    };
+  }
+
+
+  // === FARO Mail 0.4.1 - rafraichissement UI de releve regroupe ===
+  // Une releve peut produire sync.done puis mail.new, et une releve de tous
+  // les comptes produit plusieurs sync.done successifs. On regroupe ces
+  // evenements pour ne reconstruire la liste et les compteurs qu'une fois.
+  let syncUiRefreshTimer = null;
+  function scheduleSyncUiRefresh(delay = 350) {
+    if (syncUiRefreshTimer) clearTimeout(syncUiRefreshTimer);
+    syncUiRefreshTimer = setTimeout(() => {
+      syncUiRefreshTimer = null;
+
+      // sync.all traite les comptes successivement. Attendre que la rafale de
+      // releves soit terminee evite un rafraichissement complet entre comptes.
+      if (activeSyncActivities.size > 0) {
+        scheduleSyncUiRefresh(delay);
+        return;
+      }
+
+      // Respecte une recherche en cours et conserve position, selection,
+      // conversation depliee et message actif.
+      refreshVisibleList({ preserveListState: true }).catch(() => {});
+    }, delay);
+  }
+
+  async function refresh({ preserveListState = false } = {}) {
+    if (!preserveListState) closeQuickLabelMenu();
+    if (!list || !ws || ws.readyState !== WebSocket.OPEN) return;
+    const params = listParams();
+    const conversationMode = config.conversationView !== false;
+    const result = await rpc(conversationMode ? 'conversations.list' : 'messages.list', params);
+    result.rows = decorateRows(result.rows);
+    updateFolderActionButton();
+    list.setData(result.rows, mailListOptions(preserveListState));
+    hydrateSenderIcons(result.rows).catch(() => {});
+
+    const counts = result.counts || {};
+    document.getElementById('list-sub').textContent = conversationMode
+      ? (counts.messages
+          ? t('list.conversationCount', {
+              conversations: counts.n || 0,
+              messages: counts.messages || 0,
+              unread: counts.unread || 0,
+            })
+          : t('list.empty'))
+      : (counts.n
+          ? t('list.messageCount', { messages: counts.n, unread: counts.unread || 0 })
+          : t('list.empty'));
+
+    await refreshSidebarCounts();
+  }
+
+  function setCount(id, number) {
+    const element = document.getElementById(id);
+    if (element) element.textContent = number || '';
+  }
+
+  async function refreshSidebarCounts() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const [unified, spamBox, sentBox, trashBox, labels] = await Promise.all([
+      rpc('messages.list', { folderRole: 'inbox', spam: 0, limit: 1 }),
+      rpc('messages.list', { folderRoles: ['inbox', 'junk'], spam: 1, limit: 1 }),
+      rpc('messages.list', { folderRole: 'sent', spam: null, limit: 1 }),
+      rpc('messages.list', { folderRole: 'trash', spam: null, limit: 1 }),
+      rpc('labels.list'),
+    ]);
+    // Les compteurs d'étiquettes font partie de l'état courant de la barre
+    // latérale. Les laisser figés jusqu'au redémarrage était assez créatif,
+    // mais peu pratique.
+    renderLabels(labels);
+    setCount('count-unified', unified.counts.unread);
+    setCount('count-spam', spamBox.counts.n);
+    setCount('count-sent', sentBox.counts.n);
+    setCount('count-trash', trashBox.counts.n);
+    const accountCounts = await Promise.all(accounts.map(async account => {
+      try {
+        const result = await rpc('messages.list', {
+          folderRole: 'inbox', spam: 0, accountId: account.id, limit: 1,
+        });
+        return { account, counts: result.counts || {} };
+      } catch (error) {
+        return { account, counts: null, error };
+      }
+    }));
+
+    for (const { account, counts } of accountCounts) {
+      const counter = document.querySelector(`[data-count="${cssEscape(account.id)}"]`);
+      if (!counter) continue;
+      if (!counts) {
+        counter.textContent = '—';
+        counter.classList.remove('has-unread');
+        counter.title = t('account.countUnavailable');
+        continue;
+      }
+      const unread = Number(counts.unread) || 0;
+      const total = Number(counts.n) || 0;
+      counter.textContent = `${numberFormat(unread)} / ${numberFormat(total)}`;
+      counter.classList.toggle('has-unread', unread > 0);
+      counter.title = t('account.messageCounts', { unread: numberFormat(unread), total: numberFormat(total) });
+      counter.setAttribute('aria-label', counter.title);
+    }
+
+    // Dossiers IMAP supplémentaires affichés sous chaque compte : mêmes
+    // compteurs lu/non lu que la boîte de réception, obtenus par le même
+    // filtre générique `folder` déjà pris en charge par messages.list.
+    const folderTargets = accounts.flatMap(account =>
+      (Array.isArray(account.extraFolders) ? account.extraFolders : []).map(folder => ({ account, folder })));
+    const folderCounts = await Promise.all(folderTargets.map(async ({ account, folder }) => {
+      try {
+        // spam:null comme listParams() pour ce même type de vue : un dossier
+        // IMAP personnalisé n'est pas filtré par la classification indésirable.
+        const result = await rpc('messages.list', { accountId: account.id, folder, spam: null, limit: 1 });
+        return { account, folder, counts: result.counts || {} };
+      } catch (error) {
+        return { account, folder, counts: null, error };
+      }
+    }));
+    for (const { account, folder, counts } of folderCounts) {
+      const counter = document.querySelector(
+        `[data-folder-count-account="${cssEscape(account.id)}"][data-folder-count-folder="${cssEscape(folder)}"]`
+      );
+      if (!counter) continue;
+      if (!counts) {
+        counter.textContent = '—';
+        counter.classList.remove('has-unread');
+        counter.title = t('account.countUnavailable');
+        continue;
+      }
+      const unread = Number(counts.unread) || 0;
+      const total = Number(counts.n) || 0;
+      counter.textContent = total ? `${numberFormat(unread)} / ${numberFormat(total)}` : '';
+      counter.classList.toggle('has-unread', unread > 0);
+      counter.title = t('account.messageCounts', { unread: numberFormat(unread), total: numberFormat(total) });
+      counter.setAttribute('aria-label', counter.title);
+    }
+  }
+
+  function updateSearchClearButton() {
+    const input = document.getElementById('search-input');
+    const button = document.getElementById('btn-clear-search');
+    if (!input || !button) return;
+    const hasQuery = Boolean(input.value.trim());
+    button.classList.toggle('hidden', !hasQuery);
+    button.setAttribute('aria-hidden', hasQuery ? 'false' : 'true');
+  }
+
+  async function clearSearch({ focus = true } = {}) {
+    const input = document.getElementById('search-input');
+    if (!input) return;
+    input.value = '';
+    updateSearchClearButton();
+    await refresh();
+    if (focus) input.focus();
+  }
+
+  async function searchFor(query, { preserveListState = false } = {}) {
+    if (!preserveListState) {
+      closeQuickLabelMenu();
+      clearConversationPanel();
+    }
+    if (!query.trim()) return refresh({ preserveListState });
+    try {
+      let rows = await rpc('messages.search', {
+        query, limit: 300, sortBy: config.sortBy || 'date', sortDirection: config.sortDirection || 'desc',
+      });
+      rows = decorateRows(rows);
+      list.setData(rows, mailListOptions(preserveListState));
+      document.getElementById('list-sub').textContent = t('list.searchCount', { count: rows.length });
+    } catch (error) {
+      status(`${t('error')} : ${error.message}`);
+    }
+  }
+
+  async function refreshVisibleList({ preserveListState = false } = {}) {
+    const query = document.getElementById('search-input')?.value || '';
+    if (query.trim()) return searchFor(query, { preserveListState });
+    return refresh({ preserveListState });
+  }
+
+  // ---------- Onglets de lecture ----------
+  function readerTabKeyForRow(row) {
+    const isConversation = Boolean(
+      row?.is_thread && !row?.is_thread_child &&
+      config.conversationView !== false && Number(row.thread_count || 1) > 1
+    );
+    return isConversation ? `thread:${row.thread_key}` : `message:${row.id}`;
+  }
+
+  function readerTabTitle(row) {
+    const subject = String(row?.subject || t('mail.noSubject'))
+      .replace(/^\s*((re|fw|fwd|tr|aw|sv)\s*:\s*)+/gi, '')
+      .trim();
+    return subject || t('mail.noSubject');
+  }
+
+  // Onglets d'aperçu média (PDF, image...) : gérés par un module dédié plutôt
+  // que par openListItem, mais partagent la même barre d'onglets que les
+  // messages/fils. Cette table évite de dupliquer la logique d'ouverture/
+  // fermeture pour chaque nouveau type de pièce jointe prévisualisable.
+  const MEDIA_TAB_VIEWERS = {
+    pdf: () => window.PdfViewer,
+    image: () => window.ImageViewer,
+  };
+  function mediaViewerForTab(tab) {
+    const getter = tab && MEDIA_TAB_VIEWERS[tab.kind];
+    return getter ? getter() : null;
+  }
+  function closeAllMediaViewers() {
+    window.PdfViewer?.close();
+    window.ImageViewer?.close();
+  }
+
+  function readerTabIsUnread(tab) {
+    if (tab.kind === 'thread') return Number(tab.row?.thread_unread || 0) > 0;
+    if (tab.kind === 'message') return !Boolean(tab.row?.seen);
+    return false;
+  }
+
+  function renderReaderTabs() {
+    const previewButton = document.getElementById('reader-tab-preview');
+    const tabList = document.getElementById('reader-tab-list');
+    const closeAll = document.getElementById('btn-close-reader-tabs');
+    if (!previewButton || !tabList || !closeAll) return;
+
+    const previewActive = activeReaderTabKey === 'preview';
+    previewButton.classList.toggle('active', previewActive);
+    previewButton.setAttribute('aria-selected', previewActive ? 'true' : 'false');
+    previewButton.onclick = () => activateReaderTab('preview');
+
+    tabList.innerHTML = '';
+    readerTabs.forEach((tab, index) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'reader-tab';
+      button.classList.toggle('active', tab.key === activeReaderTabKey);
+      button.setAttribute('role', 'tab');
+      button.setAttribute('aria-selected', tab.key === activeReaderTabKey ? 'true' : 'false');
+      button.title = tab.title;
+      const tabIcon = tab.kind === 'thread' ? 'solid fa-comments'
+        : tab.kind === 'pdf' ? 'solid fa-file-pdf'
+        : tab.kind === 'image' ? 'solid fa-image'
+        : 'regular fa-envelope';
+      button.innerHTML = `
+        <i class="fa-${tabIcon}"></i>
+        ${readerTabIsUnread(tab) ? '<span class="reader-tab-unread"></span>' : ''}
+        <span class="reader-tab-title">${esc(tab.title)}</span>
+        <span class="reader-tab-close" role="button" data-close-tab="${index}" title="${esc(t('tabs.close'))}">
+          <i class="fa-solid fa-xmark"></i>
+        </span>`;
+      button.onclick = event => {
+        const closeButton = event.target.closest('[data-close-tab]');
+        if (closeButton) {
+          event.stopPropagation();
+          closeReaderTab(tab.key);
+          return;
+        }
+        activateReaderTab(tab.key);
+      };
+      button.onauxclick = event => {
+        if (event.button === 1) {
+          event.preventDefault();
+          closeReaderTab(tab.key);
+        }
+      };
+      tabList.appendChild(button);
+    });
+
+    closeAll.classList.toggle('hidden', readerTabs.length === 0);
+    closeAll.onclick = closeAllReaderTabs;
+    const activeElement = tabList.querySelector('.reader-tab.active');
+    activeElement?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  }
+
+  async function openItemInTab(row) {
+    if (!row || row._type === 'group') return;
+    const key = readerTabKeyForRow(row);
+    let tab = readerTabs.find(item => item.key === key);
+    if (!tab) {
+      const isThread = key.startsWith('thread:');
+      tab = {
+        key,
+        kind: isThread ? 'thread' : 'message',
+        row: { ...row },
+        title: readerTabTitle(row),
+        activeMessageId: Number(row.id) || null,
+      };
+      readerTabs.push(tab);
+    } else {
+      tab.row = { ...tab.row, ...row };
+      tab.title = readerTabTitle(row);
+    }
+    activeReaderTabKey = key;
+    renderReaderTabs();
+    try {
+      await openListItem(tab.row, {
+        fromTab: true,
+        preferredMessageId: tab.activeMessageId,
+      });
+    } catch (error) {
+      status(`${t('error')} : ${error.message}`, 'error');
+    }
+  }
+
+  async function activateReaderTab(key) {
+    if (key === activeReaderTabKey && key !== 'preview') return;
+    activeReaderTabKey = key;
+    renderReaderTabs();
+    try {
+      if (key === 'preview') {
+        if (previewReaderRow) await openListItem(previewReaderRow, { fromTab: true });
+        else clearReader();
+        return;
+      }
+      const tab = readerTabs.find(item => item.key === key);
+      if (!tab) {
+        activeReaderTabKey = 'preview';
+        renderReaderTabs();
+        return;
+      }
+      const viewer = mediaViewerForTab(tab);
+      if (viewer) {
+        await viewer.open(tab);
+        return;
+      }
+      await openListItem(tab.row, {
+        fromTab: true,
+        preferredMessageId: tab.activeMessageId,
+      });
+    } catch (error) {
+      status(`${t('error')} : ${error.message}`, 'error');
+      clearReader();
+    }
+  }
+
+  async function closeReaderTab(key) {
+    const index = readerTabs.findIndex(item => item.key === key);
+    if (index < 0) return;
+    const wasActive = activeReaderTabKey === key;
+    const closedTab = readerTabs[index];
+    readerTabs.splice(index, 1);
+    if (!wasActive) {
+      renderReaderTabs();
+      return;
+    }
+    mediaViewerForTab(closedTab)?.close();
+    const next = readerTabs[Math.min(index, readerTabs.length - 1)] || readerTabs[index - 1] || null;
+    activeReaderTabKey = next?.key || 'preview';
+    renderReaderTabs();
+    const nextViewer = mediaViewerForTab(next);
+    if (nextViewer) {
+      await nextViewer.open(next);
+    } else if (next) {
+      await openListItem(next.row, {
+        fromTab: true,
+        preferredMessageId: next.activeMessageId,
+      });
+    } else if (previewReaderRow) await openListItem(previewReaderRow, { fromTab: true });
+    else clearReader();
+  }
+
+  async function closeAllReaderTabs() {
+    closeAllMediaViewers();
+    readerTabs = [];
+    activeReaderTabKey = 'preview';
+    renderReaderTabs();
+    if (previewReaderRow) await openListItem(previewReaderRow, { fromTab: true });
+    else clearReader();
+  }
+
+  function updateActiveReaderTab(message) {
+    if (activeReaderTabKey === 'preview') return;
+    const tab = readerTabs.find(item => item.key === activeReaderTabKey);
+    if (!tab) return;
+    tab.activeMessageId = Number(message.meta?.id) || tab.activeMessageId;
+    tab.title = message.headers?.subject || tab.title || t('mail.noSubject');
+    if (tab.kind === 'message') tab.row = { ...tab.row, ...message.meta };
+    renderReaderTabs();
+  }
+
+  function updateReaderTabsFlag(row, patch) {
+    readerTabs.forEach(tab => {
+      const sameMessage = tab.kind === 'message' && Number(tab.row?.id) === Number(row?.id);
+      const sameThread = tab.kind === 'thread' && tab.row?.thread_key === row?.thread_key;
+      if (sameMessage || sameThread) Object.assign(tab.row, patch);
+    });
+    renderReaderTabs();
+  }
+
+  function closeReaderTabsForItems(items) {
+    const selected = Array.isArray(items) ? items : [];
+    const matchesRow = row => selected.some(item => {
+      if (item.type === 'thread') {
+        return row?.thread_key === item.threadKey || row?.parent_thread_key === item.threadKey;
+      }
+      return Number(row?.id) === Number(item.id);
+    });
+    const shouldClose = tab => matchesRow(tab.row);
+    const activeRemoved = readerTabs.some(tab => tab.key === activeReaderTabKey && shouldClose(tab));
+    readerTabs = readerTabs.filter(tab => !shouldClose(tab));
+    if (previewReaderRow && matchesRow(previewReaderRow)) previewReaderRow = null;
+    if (activeRemoved) activeReaderTabKey = 'preview';
+    renderReaderTabs();
+  }
+
+  // ---------- Lecture / conversations ----------
+  // FARO Mail 0.2.24 UI v18 — bascule explicite et état demandé mémorisé.
+  // Le bouton de flèche appelle désormais uniquement toggle-thread dans
+  // maillist.js. Ces deux tables servent à conserver le dernier état demandé
+  // lorsqu'un chargement de conversation est encore en cours.
+  const threadToggleOperations = new Map();
+  const threadToggleTargets = new Map();
+
+  async function openListItem(row, { fromTab = false, preferredMessageId = null } = {}) {
+    closeAllMediaViewers();
+    // Le message affiché dans l'aperçu doit rester identifiable dans la liste.
+    // Pour un fil, openConversation()/expandThread() affinera ensuite l'état
+    // actif vers le message réellement présenté dans le lecteur.
+    list?.setActiveMessage(row.id);
+    if (!fromTab) {
+      previewReaderRow = { ...row };
+      activeReaderTabKey = 'preview';
+      renderReaderTabs();
+    }
+    if (row.is_thread_child) {
+      await openConversationChild(row);
+    } else if (row.is_thread && config.conversationView !== false) {
+      // FARO Mail 0.2.24 UI v16 — le compteur de la liste peut ne contenir
+      // que les messages du dossier courant. La lecture du fil complet reste
+      // la source de vérité et gère elle-même le cas d'un message unique.
+      await openConversation(row, preferredMessageId);
+    } else {
+      clearConversationPanel();
+      await openMessage(row);
+    }
+  }
+
+  async function fetchConversation(threadKey) {
+    const thread = await rpc('conversations.read', { threadKey });
+    currentConversation = thread;
+    return thread.messages || [];
+  }
+
+  async function openConversation(row, preferredMessageId = null) {
+    const messages = await fetchConversation(row.thread_key);
+    if (!messages.length) return;
+
+    // Garde-fou : même si le compteur fourni par la liste est incohérent,
+    // un fil réduit à un seul message reste une ligne simple.
+    if (messages.length === 1) {
+      list.collapseThread(row.thread_key);
+      clearConversationPanel();
+      await openMessage(messages[0]);
+      return;
+    }
+
+    const latest = messages[messages.length - 1];
+    const target = messages.find(message => Number(message.id) === Number(preferredMessageId)) || latest;
+    list.expandThread(row.thread_key, messages, target.id);
+    renderConversationPanel(messages, target.id);
+    await openMessage(target, { keepConversation: true });
+  }
+
+  async function openConversationChild(row) {
+    const threadKey = row.parent_thread_key || row.thread_key;
+    let messages = currentConversation?.threadKey === threadKey ? currentConversation.messages : null;
+    if (!messages) messages = await fetchConversation(threadKey);
+    list.expandThread(threadKey, messages, row.id);
+    renderConversationPanel(messages, row.id);
+    await openMessage(row, { keepConversation: true });
+  }
+
+  async function toggleConversation(row) {
+    // FARO Mail 0.2.24 UI v18 — chaque clic inverse le dernier état demandé,
+    // même si la lecture RPC précédente n'est pas encore terminée.
+    const key = String(row?.thread_key || row?.parent_thread_key || '');
+    if (!key) return;
+
+    const requestedState = threadToggleTargets.has(key)
+      ? Boolean(threadToggleTargets.get(key))
+      : list.isThreadExpanded(key);
+    threadToggleTargets.set(key, !requestedState);
+
+    if (threadToggleOperations.has(key)) {
+      return threadToggleOperations.get(key);
+    }
+
+    const operation = (async () => {
+      // Quelques passages suffisent même en cas de clics rapides. La boucle
+      // converge vers le dernier état demandé au lieu d'ignorer les clics.
+      for (let pass = 0; pass < 8; pass += 1) {
+        const targetExpanded = Boolean(threadToggleTargets.get(key));
+        const currentlyExpanded = list.isThreadExpanded(key);
+        if (targetExpanded === currentlyExpanded) break;
+
+        if (!targetExpanded) {
+          list.collapseThread(key);
+          continue;
+        }
+
+        const stateBeforeLoad = list.isThreadExpanded(key);
+        await openConversation(row);
+        const stateAfterLoad = list.isThreadExpanded(key);
+
+        // Un fil réellement réduit à un seul message ne peut pas être déplié.
+        // On évite alors de relancer indéfiniment la même lecture.
+        if (stateAfterLoad === stateBeforeLoad && stateAfterLoad !== targetExpanded) {
+          threadToggleTargets.set(key, stateAfterLoad);
+          break;
+        }
+      }
+    })();
+
+    threadToggleOperations.set(key, operation);
+    try {
+      await operation;
+    } finally {
+      if (threadToggleOperations.get(key) === operation) {
+        threadToggleOperations.delete(key);
+        threadToggleTargets.delete(key);
+      }
+    }
+  }
+
+  function renderConversationPanel(messages, activeId) {
+    const panel = document.getElementById('conversation-panel');
+    if (!messages || messages.length <= 1) {
+      panel.classList.add('hidden');
+      panel.innerHTML = '';
+      return;
+    }
+
+    panel.classList.remove('hidden');
+    panel.innerHTML = `
+      <div class="conversation-title">
+        <i class="fa-solid fa-comments"></i>
+        <span>${esc(t('conversation.title', { count: messages.length }))}</span>
+      </div>
+      <div class="conversation-items"></div>`;
+    const items = panel.querySelector('.conversation-items');
+
+    messages.forEach((message, index) => {
+      const button = document.createElement('button');
+      button.className = 'conversation-card';
+      button.classList.toggle('active', message.id === activeId);
+      button.classList.toggle('conversation-reply', index > 0);
+      button.classList.toggle('unread', !message.seen);
+      const outgoing = message.folder_role === 'sent';
+      const correspondentAddress = outgoing ? message.to_addr : message.from_addr;
+      const knownContact = contactDirectoryEntry(correspondentAddress);
+      const sender = outgoing
+        ? (knownContact?.displayName || message.to_addr || t('mail.unknownRecipient'))
+        : (message.contact_name || knownContact?.displayName || message.from_name || message.from_addr || t('mail.unknownSender'));
+      const account = App.accountEmail(message.account_id);
+      button.innerHTML = `
+        <span class="conversation-unread-dot"></span>
+        <span class="conversation-avatar"></span>
+        <span class="conversation-main">
+          <span class="conversation-from">${outgoing ? esc(t('mail.to', { recipient: sender })) : esc(sender)}</span>
+          ${outgoing ? `<span class="conversation-account">${esc(t('sent.viaAccount', { account }))}</span>` : ''}
+          <span class="conversation-snippet">${esc(message.snippet || message.subject || '')}</span>
+        </span>
+        <span class="conversation-meta">
+          <span>${esc(fmtDateTime(message.date))}</span>
+          ${message.has_attach ? '<i class="fa-solid fa-paperclip"></i>' : ''}
+          ${message.flagged ? '<i class="fa-solid fa-star"></i>' : ''}
+        </span>`;
+      setAvatarElement(button.querySelector('.conversation-avatar'), {
+        avatarData: knownContact?.avatarData || '',
+        initials: contactInitials({ displayName: sender, email: correspondentAddress }),
+        fallbackColor: colorFrom(correspondentAddress || sender),
+      });
+      button.onclick = async () => {
+        list.setActiveMessage(message.id);
+        renderConversationPanel(messages, message.id);
+        await openMessage(message, { keepConversation: true });
+      };
+      items.appendChild(button);
+    });
+  }
+
+  function clearReadTimer() {
+    if (currentReadTimer) clearTimeout(currentReadTimer);
+    currentReadTimer = null;
+    currentMessageToken++;
+  }
+
+  function clearConversationPanel() {
+    currentConversation = null;
+    const panel = document.getElementById('conversation-panel');
+    panel.innerHTML = '';
+    panel.classList.add('hidden');
+  }
+
+  const RECIPIENT_PREVIEW_COUNT = 6;
+  function formatRecipientEntry(entry) {
+    return entry.name ? `${entry.name} <${entry.address}>` : entry.address;
+  }
+
+  // Un message envoyé à des centaines de destinataires (diffusion, liste) ne
+  // doit ni rendre l'en-tête illisible ni, via son débordement, réduire à
+  // zéro l'espace du corps du message (voir aussi le plafond CSS sur
+  // #reader-head). On n'affiche qu'un aperçu, avec bascule pour tout voir.
+  function renderRecipientLine(element, list, fallbackText) {
+    if (!element) return;
+    element.innerHTML = '';
+    element.classList.remove('expandable', 'expanded');
+    const entries = Array.isArray(list) && list.length ? list : null;
+    if (!entries) {
+      element.textContent = fallbackText ? '→ ' + fallbackText : '';
+      return;
+    }
+    element.classList.add('expandable');
+    const prefix = document.createElement('span');
+    prefix.textContent = '→';
+    element.appendChild(prefix);
+    const showAll = entries.length <= RECIPIENT_PREVIEW_COUNT + 2;
+    const visibleCount = showAll ? entries.length : RECIPIENT_PREVIEW_COUNT;
+    const previewText = entries.slice(0, visibleCount).map(formatRecipientEntry).join(', ');
+    const fullText = entries.map(formatRecipientEntry).join(', ');
+    const textSpan = document.createElement('span');
+    textSpan.className = 'r-to-text';
+    textSpan.textContent = previewText;
+    element.appendChild(textSpan);
+    const remaining = entries.length - visibleCount;
+    if (remaining > 0) {
+      const toggle = document.createElement('button');
+      toggle.type = 'button';
+      toggle.className = 'r-to-more';
+      toggle.textContent = t('reader.moreRecipients', { count: remaining });
+      toggle.onclick = () => {
+        const expanded = element.classList.toggle('expanded');
+        textSpan.textContent = expanded ? fullText : previewText;
+        toggle.textContent = expanded ? t('reader.fewerRecipients') : t('reader.moreRecipients', { count: remaining });
+      };
+      element.appendChild(toggle);
+    }
+  }
+
+  async function openMessage(row, { keepConversation = false } = {}) {
+    closeRemoteContentDialog();
+    clearReadTimer();
+    if (!keepConversation) clearConversationPanel();
+    const token = currentMessageToken;
+    const message = await rpc('messages.read', { id: row.id });
+    if (token !== currentMessageToken) return;
+    updateActiveReaderTab(message);
+
+    if (currentConversation) list.setActiveMessage(row.id);
+
+    document.getElementById('reader-empty').classList.add('hidden');
+    document.getElementById('reader-content').classList.remove('hidden');
+    document.getElementById('r-subject').textContent = message.headers.subject || t('mail.noSubject');
+    document.getElementById('r-from').textContent = message.headers.from || '';
+    document.getElementById('r-date').textContent = message.headers.date
+      ? ' — ' + new Date(message.headers.date).toLocaleString(I18N.locale)
+      : '';
+    renderRecipientLine(document.getElementById('r-to'), message.headers.toList, message.headers.to);
+
+    const flagIcon = document.getElementById('btn-r-flag').querySelector('i');
+    flagIcon.className = message.meta.flagged ? 'fa-solid fa-star' : 'fa-regular fa-star';
+    const spamButton = document.getElementById('btn-r-spam');
+    const inTrash = message.meta.folder_role === 'trash';
+    spamButton.classList.toggle('hidden', ['sent', 'trash'].includes(message.meta.folder_role));
+    spamButton.title = t(message.meta.is_spam ? 'action.notspam' : 'action.spam');
+    const restoreButton = document.getElementById('btn-r-restore');
+    restoreButton.classList.toggle('hidden', !inTrash);
+    restoreButton.title = t('trash.restoreConversation');
+    document.getElementById('btn-r-delete').title = t(
+      inTrash ? 'trash.deletePermanent' : 'trash.move'
+    );
+    setReaderSeenButton(Boolean(message.meta.seen));
+    updateReaderContactState(message);
+
+    const attachments = document.getElementById('attachments');
+    attachments.innerHTML = '';
+    attachments.classList.toggle('visible', message.attachments.length > 0);
+    for (const attachment of message.attachments) {
+      const wrapper = document.createElement('div');
+      wrapper.className = attachment.calendarInvite ? 'att-calendar-item' : 'att-item';
+      const isPdf = !attachment.calendarInvite && (
+        String(attachment.contentType || '').toLowerCase() === 'application/pdf'
+        || /\.pdf$/i.test(attachment.filename || '')
+      );
+      const isImage = !attachment.calendarInvite && !isPdf && (
+        String(attachment.contentType || '').toLowerCase().startsWith('image/')
+        || /\.(png|jpe?g|gif|webp|bmp|svg|ico|avif)$/i.test(attachment.filename || '')
+      );
+      const previewIcon = attachment.calendarInvite ? 'fa-calendar-days'
+        : isPdf ? 'fa-file-pdf' : isImage ? 'fa-image' : 'fa-paperclip';
+      const openPreview = () => {
+        if (isPdf) return openPdfAttachment(message.meta.id, attachment);
+        if (isImage) return openImageAttachment(message.meta.id, attachment);
+        return saveAttachment(message.meta.id, attachment);
+      };
+
+      const chip = document.createElement('button');
+      chip.className = 'att-chip';
+      chip.innerHTML = `<i class="fa-solid ${previewIcon}"></i>${esc(attachment.filename)}
+        <span class="size">${fmtSize(attachment.size)}</span>`;
+      chip.title = t(isPdf || isImage ? 'attachment.preview' : 'attachment.download');
+      chip.onclick = openPreview;
+      wrapper.appendChild(chip);
+
+      if (isPdf || isImage) {
+        const downloadButton = document.createElement('button');
+        downloadButton.className = 'iconbtn att-pdf-download';
+        downloadButton.title = t('attachment.download');
+        downloadButton.innerHTML = '<i class="fa-solid fa-download"></i>';
+        downloadButton.onclick = event => { event.stopPropagation(); saveAttachment(message.meta.id, attachment); };
+        wrapper.appendChild(downloadButton);
+      }
+
+      if (attachment.calendarInvite) {
+        const addButton = document.createElement('button');
+        addButton.className = 'btn compact att-calendar-add';
+        addButton.innerHTML = `<i class="fa-solid ${attachment.calendarImportedAt ? 'fa-arrows-rotate' : 'fa-calendar-plus'}"></i><span>${esc(t(attachment.calendarImportedAt ? 'attachment.updatePlanner' : 'attachment.addToPlanner'))}</span>`;
+        addButton.onclick = () => importCalendarAttachment(message.meta.id, attachment, addButton);
+        wrapper.appendChild(addButton);
+        if (attachment.calendarImportedAt) {
+          const imported = document.createElement('span');
+          imported.className = 'att-calendar-state';
+          imported.innerHTML = `<i class="fa-solid fa-circle-check"></i>${esc(t('attachment.inPlanner'))}`;
+          wrapper.appendChild(imported);
+        }
+      }
+      attachments.appendChild(wrapper);
+    }
+    Viewer.show({ ...message, meta: message.meta });
+    scheduleAutoMarkRead(message.meta, token);
+  }
+
+  function scheduleAutoMarkRead(meta, token) {
+    if (meta.seen || config.autoMarkRead === false) return;
+    const seconds = Math.max(0, Math.min(3600, Number(config.markReadDelaySeconds) || 0));
+    const run = () => {
+      currentReadTimer = null;
+      if (token !== currentMessageToken || Viewer.current?.meta?.id !== meta.id) return;
+      setSeenState(meta, true, { automatic: true }).catch(error => status(error.message));
+    };
+    if (seconds === 0) run();
+    else currentReadTimer = setTimeout(run, seconds * 1000);
+  }
+
+  function setReaderSeenButton(seen) {
+    const button = document.getElementById('btn-r-seen');
+    button.dataset.seen = seen ? '1' : '0';
+    button.title = t(seen ? 'action.markUnread' : 'action.markRead');
+    button.querySelector('i').className = seen ? 'fa-solid fa-envelope' : 'fa-regular fa-envelope-open';
+  }
+
+  async function setSeenState(row, seen, { automatic = false } = {}) {
+    const isThread = Boolean(row.is_thread && !row.is_thread_child);
+    if (isThread) {
+      await rpc('conversations.setSeen', { threadKey: row.thread_key, value: seen });
+      const threadPatch = {
+        seen: seen ? 1 : 0,
+        thread_unread: seen ? 0 : Number(row.thread_count || 1),
+      };
+      list.patchThread(row.thread_key, threadPatch);
+      updateReaderTabsFlag(row, threadPatch);
+      if (currentConversation?.threadKey === row.thread_key) {
+        currentConversation.messages.forEach(message => { message.seen = seen ? 1 : 0; });
+        list.expandThread(row.thread_key, currentConversation.messages, Viewer.current?.meta?.id);
+        renderConversationPanel(currentConversation.messages, Viewer.current?.meta?.id);
+      }
+    } else {
+      await rpc('messages.setFlag', { id: row.id, flag: 'seen', value: seen });
+      row.seen = seen ? 1 : 0;
+      updateReaderTabsFlag(row, { seen: row.seen });
+      if (currentConversation && currentConversation.messages.some(message => message.id === row.id)) {
+        const item = currentConversation.messages.find(message => message.id === row.id);
+        if (item) item.seen = seen ? 1 : 0;
+        list.patchConversationMessage(currentConversation.threadKey, row.id, { seen: seen ? 1 : 0 });
+        renderConversationPanel(currentConversation.messages, row.id);
+      } else {
+        list.patchRow(row.id, { seen: seen ? 1 : 0 });
+      }
+    }
+
+    if (Viewer.current?.meta?.id === row.id) {
+      Viewer.current.meta.seen = seen ? 1 : 0;
+      setReaderSeenButton(seen);
+    }
+    if (!automatic) clearReadTimer();
+    refreshSidebarCounts().catch(() => {});
+  }
+
+  function clearReader() {
+    closeAllMediaViewers();
+    clearExternalTarget();
+    closeRemoteContentDialog();
+    clearReadTimer();
+    clearConversationPanel();
+    if (activeReaderTabKey !== 'preview') {
+      activeReaderTabKey = 'preview';
+      renderReaderTabs();
+    }
+    document.getElementById('reader-content').classList.add('hidden');
+    document.getElementById('reader-empty').classList.remove('hidden');
+    const badge = document.getElementById('r-contact-badge');
+    badge?.classList.add('hidden');
+    const contactButton = document.getElementById('btn-r-contact');
+    if (contactButton) {
+      contactButton.dataset.contactId = '';
+      contactButton.querySelector('i').className = 'fa-solid fa-user-plus';
+    }
+  }
+
+  async function saveAttachment(messageId, attachment) {
+    const target = await Neutralino.os.showSaveDialog(t('compose.attach'), {
+      defaultPath: attachment.filename,
+    });
+    if (!target) return;
+    await rpc('attachments.save', { messageId, index: attachment.index, targetPath: target });
+    status('✓ ' + attachment.filename);
+  }
+
+  // Ouvre une pièce jointe PDF dans un onglet du lecteur (comme un message),
+  // rendue localement par PDF.js sans écrire de fichier temporaire visible.
+  async function openMediaAttachmentTab(kind, messageId, attachment) {
+    const key = `${kind}:${messageId}:${attachment.index}`;
+    let tab = readerTabs.find(item => item.key === key);
+    if (!tab) {
+      tab = { key, kind, title: attachment.filename, messageId, attachment };
+      readerTabs.push(tab);
+    } else {
+      tab.attachment = attachment;
+    }
+    activeReaderTabKey = key;
+    renderReaderTabs();
+    try {
+      await mediaViewerForTab(tab)?.open(tab);
+    } catch (error) {
+      status(`${t('error')} : ${error.message}`, 'error');
+    }
+  }
+  const openPdfAttachment = (messageId, attachment) => openMediaAttachmentTab('pdf', messageId, attachment);
+  const openImageAttachment = (messageId, attachment) => openMediaAttachmentTab('image', messageId, attachment);
+
+  async function importCalendarAttachment(messageId, attachment, button) {
+    if (!attachment?.calendarInvite || !button) return;
+    const originalHtml = button.innerHTML;
+    button.disabled = true;
+    button.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i><span>${esc(t('attachment.addingToPlanner'))}</span>`;
+    try {
+      const result = await rpc('calendar.importAttachment', { messageId, index: attachment.index });
+      attachment.calendarImportedAt = Number(result.importedAt) || Date.now();
+      attachment.calendarEventCount = Number(result.eventCount) || Number(result.total) || 0;
+      button.innerHTML = `<i class="fa-solid fa-arrows-rotate"></i><span>${esc(t('attachment.updatePlanner'))}</span>`;
+      const wrapper = button.closest('.att-calendar-item');
+      if (wrapper && !wrapper.querySelector('.att-calendar-state')) {
+        const imported = document.createElement('span');
+        imported.className = 'att-calendar-state';
+        imported.innerHTML = `<i class="fa-solid fa-circle-check"></i>${esc(t('attachment.inPlanner'))}`;
+        wrapper.appendChild(imported);
+      }
+      status(t(Number(result.created) > 0 ? 'attachment.addedToPlanner' : 'attachment.updatedInPlanner', { count: attachment.calendarEventCount }), 'success');
+      window.PlannerUI?.refreshSummary?.();
+    } catch (error) {
+      button.innerHTML = originalHtml;
+      status(`${t('attachment.calendarImportFailed')} : ${error.message}`, 'error');
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  // ---------- Carnet d'adresses ----------
+  function contactInitials(contact) {
+    const source = contact?.displayName || contact?.firstName || contact?.lastName || contact?.primaryEmail || contact?.email || '?';
+    const parts = String(source).trim().split(/\s+/).filter(Boolean);
+    return (parts.length > 1 ? parts[0][0] + parts[parts.length - 1][0] : parts[0]?.slice(0, 2) || '?').toUpperCase();
+  }
+
+  function normalizeContactLookupEmail(value) {
+    let text = String(value || '').trim();
+    const bracket = text.match(/<([^>]+)>/);
+    if (bracket) text = bracket[1];
+    text = text.split(/[,;]/)[0].trim().toLowerCase();
+    return text;
+  }
+
+  function contactDirectoryEntry(value) {
+    return contactDirectory.get(normalizeContactLookupEmail(value)) || null;
+  }
+
+  async function refreshContactDirectory() {
+    const rows = await rpc('contacts.directory');
+    const next = new Map();
+    for (const row of Array.isArray(rows) ? rows : []) {
+      const email = normalizeContactLookupEmail(row.email);
+      if (email) next.set(email, row);
+    }
+    contactDirectory = next;
+    return next;
+  }
+
+  function setAvatarElement(element, { avatarData = '', initials = '?', fallbackColor = 'var(--accent)' } = {}) {
+    if (!element) return;
+    element.style.backgroundColor = fallbackColor;
+    if (avatarData) {
+      element.style.backgroundImage = `url("${avatarData}")`;
+      element.textContent = '';
+      element.classList.add('has-avatar');
+    } else {
+      element.style.backgroundImage = 'none';
+      element.textContent = initials || '?';
+      element.classList.remove('has-avatar');
+    }
+  }
+
+  function updateContactAvatarPreview(contact = {}) {
+    const fallbackEmail = contact.primaryEmail || contact.email || document.getElementById('contact-emails')?.value.split(/[\n;,]/)[0] || '';
+    const fallbackName = contact.displayName || document.getElementById('contact-display-name')?.value || '';
+    setAvatarElement(document.getElementById('contact-editor-avatar'), {
+      avatarData: contactAvatarData,
+      initials: contactInitials({ ...contact, displayName: fallbackName, email: fallbackEmail }),
+      fallbackColor: colorFrom(fallbackEmail || fallbackName || 'contact'),
+    });
+    document.getElementById('btn-remove-contact-avatar')?.classList.toggle('hidden', !contactAvatarData);
+  }
+
+  async function imageBlobToAvatarData(blob) {
+    if (!blob || !blob.size) throw new Error(t('contacts.avatarInvalid'));
+    if (blob.size > 12 * 1024 * 1024) throw new Error(t('contacts.avatarTooLarge'));
+    if (blob.type && !['image/png', 'image/jpeg', 'image/webp'].includes(blob.type)) {
+      throw new Error(t('contacts.avatarInvalid'));
+    }
+
+    const url = URL.createObjectURL(blob);
+    try {
+      const image = await new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = () => reject(new Error(t('contacts.avatarInvalid')));
+        img.src = url;
+      });
+      if (!image.naturalWidth || !image.naturalHeight) throw new Error(t('contacts.avatarInvalid'));
+
+      const size = 256;
+      const canvas = document.createElement('canvas');
+      canvas.width = size;
+      canvas.height = size;
+      const context = canvas.getContext('2d');
+      if (!context) throw new Error(t('contacts.avatarInvalid'));
+
+      const scale = Math.max(size / image.naturalWidth, size / image.naturalHeight);
+      const width = image.naturalWidth * scale;
+      const height = image.naturalHeight * scale;
+      context.clearRect(0, 0, size, size);
+      context.drawImage(image, (size - width) / 2, (size - height) / 2, width, height);
+
+      const webp = canvas.toDataURL('image/webp', 0.86);
+      return webp.startsWith('data:image/webp') ? webp : canvas.toDataURL('image/png');
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+
+  function chooseContactAvatar() {
+    const input = document.getElementById('contact-avatar-file');
+    if (!input) {
+      document.getElementById('contact-form-error').textContent = t('contacts.avatarInvalid');
+      return;
+    }
+    input.value = '';
+    input.click();
+  }
+
+  async function handleContactAvatarFile(event) {
+    const input = event.currentTarget;
+    const file = input.files?.[0];
+    if (!file) return;
+    const errorElement = document.getElementById('contact-form-error');
+    errorElement.textContent = '';
+    try {
+      contactAvatarData = await imageBlobToAvatarData(file);
+      updateContactAvatarPreview();
+    } catch (error) {
+      errorElement.textContent = error.message || t('contacts.avatarInvalid');
+    } finally {
+      input.value = '';
+    }
+  }
+
+  function removeContactAvatar() {
+    contactAvatarData = '';
+    updateContactAvatarPreview();
+  }
+
+  async function refreshContactsCount() {
+    const result = await rpc('contacts.list', { limit: 1 });
+    const count = Number(result.counts?.n) || 0;
+    const badge = document.getElementById('contacts-count');
+    if (badge) {
+      badge.textContent = count > 99 ? '99+' : String(count);
+      badge.classList.toggle('hidden', count === 0);
+    }
+    return result.counts || { n: count };
+  }
+
+  function contactAccountOptions(selected = '') {
+    return `<option value="">${esc(t('contacts.noPreferredAccount'))}</option>` + accounts.map(account =>
+      `<option value="${esc(account.id)}" ${String(account.id) === String(selected) ? 'selected' : ''}>${esc(account.displayName || account.email)} — ${esc(account.email)}</option>`
+    ).join('');
+  }
+
+  function renderContactGroupFilter(selected = '') {
+    const select = document.getElementById('contacts-group-filter');
+    if (!select) return;
+    select.innerHTML = `<option value="">${esc(t('contacts.allGroups'))}</option>` + contactGroups.map(group =>
+      `<option value="${group.id}" ${String(group.id) === String(selected) ? 'selected' : ''}>${esc(group.name)} (${Number(group.contactCount) || 0})</option>`
+    ).join('');
+  }
+
+  function normalizeContactGroupNames(groups) {
+    if (typeof groups === 'string') groups = groups.split(',');
+    return (Array.isArray(groups) ? groups : []).map(group =>
+      String(typeof group === 'string' ? group : group?.name || '').trim()
+    ).filter(Boolean);
+  }
+
+  function renderContactNewGroupChips() {
+    const container = document.getElementById('contact-new-group-chips');
+    if (!container) return;
+    container.innerHTML = '';
+    for (const name of contactPendingNewGroups) {
+      const chip = document.createElement('span');
+      chip.className = 'contact-new-group-chip';
+      chip.innerHTML = `<i class="fa-solid fa-folder-plus"></i><span>${esc(name)}</span><button type="button" title="${esc(t('contacts.removePendingGroup'))}"><i class="fa-solid fa-xmark"></i></button>`;
+      chip.querySelector('button').onclick = () => {
+        contactPendingNewGroups.delete(name);
+        renderContactNewGroupChips();
+      };
+      container.appendChild(chip);
+    }
+    container.classList.toggle('hidden', contactPendingNewGroups.size === 0);
+  }
+
+  function renderContactGroupAssignments(selectedGroups = []) {
+    const selectedNames = normalizeContactGroupNames(selectedGroups);
+    const selectedLower = new Set(selectedNames.map(name => name.toLowerCase()));
+    const existingLower = new Map(contactGroups.map(group => [String(group.name).toLowerCase(), group]));
+    contactPendingNewGroups = new Set(selectedNames.filter(name => !existingLower.has(name.toLowerCase())));
+    const container = document.getElementById('contact-groups-existing');
+    if (!container) return;
+    container.dataset.emptyLabel = t('contacts.noGroups');
+    container.innerHTML = '';
+    for (const group of contactGroups) {
+      const label = document.createElement('label');
+      label.className = 'contact-group-choice';
+      label.innerHTML = `<input type="checkbox" data-contact-group-name="${esc(group.name)}" ${selectedLower.has(String(group.name).toLowerCase()) ? 'checked' : ''}><span class="account-dot" style="background:${safeColor(group.color)}"></span><span>${esc(group.name)}</span>`;
+      container.appendChild(label);
+    }
+    renderContactNewGroupChips();
+  }
+
+  function addPendingContactGroup() {
+    const input = document.getElementById('contact-new-group');
+    const name = String(input?.value || '').trim().slice(0, 80);
+    if (!name) return;
+    const existing = contactGroups.find(group => String(group.name).toLowerCase() === name.toLowerCase());
+    if (existing) {
+      const checkbox = [...document.querySelectorAll('[data-contact-group-name]')]
+        .find(item => String(item.dataset.contactGroupName).toLowerCase() === name.toLowerCase());
+      if (checkbox) checkbox.checked = true;
+    } else {
+      for (const current of [...contactPendingNewGroups]) {
+        if (current.toLowerCase() === name.toLowerCase()) contactPendingNewGroups.delete(current);
+      }
+      contactPendingNewGroups.add(name);
+      renderContactNewGroupChips();
+    }
+    input.value = '';
+    input.focus();
+  }
+
+  function selectedContactGroupNames() {
+    return [
+      ...[...document.querySelectorAll('[data-contact-group-name]:checked')].map(input => input.dataset.contactGroupName),
+      ...contactPendingNewGroups,
+    ];
+  }
+
+  function renderContactsList(result, { preserveSelection = false } = {}) {
+    contactsCache = Array.isArray(result.rows) ? result.rows : [];
+    contactGroups = Array.isArray(result.groups) ? result.groups : [];
+    const selectedGroup = document.getElementById('contacts-group-filter')?.value || '';
+    renderContactGroupFilter(selectedGroup);
+    const listElement = document.getElementById('contacts-list');
+    const empty = document.getElementById('contacts-empty');
+    listElement.innerHTML = '';
+
+    for (const contact of contactsCache) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'contact-list-row';
+      button.dataset.contactId = contact.id;
+      button.classList.toggle('active', Number(editingContactId) === Number(contact.id));
+      const metaIcons = [
+        contact.favorite ? '<i class="fa-solid fa-star" title="' + esc(t('contacts.favorite')) + '"></i>' : '',
+        contact.trusted ? '<i class="fa-solid fa-shield-halved" title="' + esc(t('contacts.trusted')) + '"></i>' : '',
+        contact.messageCount ? `<span title="${esc(t('contacts.messageCount', { count: contact.messageCount }))}">${contact.messageCount}</span>` : '',
+      ].filter(Boolean).join('');
+      button.innerHTML = `
+        <span class="contact-list-avatar"></span>
+        <span class="contact-list-main"><strong>${esc(contact.displayName || contact.primaryEmail)}</strong><span>${esc(contact.primaryEmail || contact.company || '')}</span></span>
+        <span class="contact-list-meta">${metaIcons}</span>`;
+      setAvatarElement(button.querySelector('.contact-list-avatar'), {
+        avatarData: contact.avatarData || '',
+        initials: contactInitials(contact),
+        fallbackColor: colorFrom(contact.primaryEmail || contact.displayName),
+      });
+      button.onclick = () => editContact(contact);
+      listElement.appendChild(button);
+    }
+
+    listElement.classList.toggle('hidden', contactsCache.length === 0);
+    empty.classList.toggle('hidden', contactsCache.length > 0);
+    const counts = result.counts || {};
+    document.getElementById('contacts-summary').textContent = t('contacts.summary', {
+      count: Number(counts.n) || contactsCache.length,
+      trusted: Number(counts.trusted) || 0,
+      favorites: Number(counts.favorites) || 0,
+    });
+    const badge = document.getElementById('contacts-count');
+    if (badge) {
+      const total = Number(counts.n) || 0;
+      badge.textContent = total > 99 ? '99+' : String(total);
+      badge.classList.toggle('hidden', total === 0);
+    }
+
+    if (preserveSelection && editingContactId) {
+      const selected = contactsCache.find(contact => Number(contact.id) === Number(editingContactId));
+      if (selected) editContact(selected, { focus: false });
+    }
+  }
+
+  async function loadContacts({ preserveSelection = false } = {}) {
+    const query = document.getElementById('contacts-search')?.value || '';
+    const groupId = document.getElementById('contacts-group-filter')?.value || null;
+    const result = await rpc('contacts.list', { query, groupId, limit: 1000 });
+    renderContactsList(result, { preserveSelection });
+    return result;
+  }
+
+  let contactSubscriptionsState = [];
+
+  function formatContactSubscriptionSync(subscription) {
+    if (subscription.lastStatus === 'error') return subscription.lastError || t('error');
+    if (!subscription.lastSyncAt) return t('planner.neverSynced');
+    return t('planner.lastSync', { date: new Date(subscription.lastSyncAt).toLocaleString(I18N.locale) });
+  }
+
+  function renderContactSubscriptions() {
+    const root = document.getElementById('contact-subscriptions-list');
+    const empty = document.getElementById('contact-subscriptions-empty');
+    if (!root || !empty) return;
+    empty.classList.toggle('hidden', contactSubscriptionsState.length > 0);
+    root.classList.toggle('hidden', contactSubscriptionsState.length === 0);
+    root.innerHTML = contactSubscriptionsState.map(subscription => {
+      const error = subscription.lastStatus === 'error';
+      let host = subscription.url;
+      try { host = new URL(subscription.url).hostname; } catch {}
+      return `<div class="planner-subscription-row" data-subscription-id="${Number(subscription.id)}">
+        <div class="planner-subscription-main">
+          <strong class="planner-subscription-title"><span>${esc(subscription.name || host)}</span></strong>
+          <small>${esc(host)}</small>
+          <span class="planner-subscription-meta"><i class="fa-solid ${error ? 'fa-circle-exclamation error' : 'fa-circle-check ok'}"></i><span>${esc(formatContactSubscriptionSync(subscription))}</span></span>
+        </div>
+        <div class="planner-subscription-actions">
+          <button class="iconbtn" type="button" data-contact-sub-sync="${Number(subscription.id)}" title="${esc(t('planner.syncSubscription'))}"><i class="fa-solid fa-rotate"></i></button>
+          <button class="iconbtn danger-hover" type="button" data-contact-sub-remove="${Number(subscription.id)}" title="${esc(t('planner.removeSubscription'))}"><i class="fa-solid fa-trash"></i></button>
+        </div>
+      </div>`;
+    }).join('');
+    root.querySelectorAll('[data-contact-sub-sync]').forEach(button =>
+      button.addEventListener('click', () => syncContactSubscriptionUI(Number(button.dataset.contactSubSync), button)));
+    root.querySelectorAll('[data-contact-sub-remove]').forEach(button =>
+      button.addEventListener('click', () => removeContactSubscriptionUI(Number(button.dataset.contactSubRemove))));
+  }
+
+  function contactSubscriptionStatus(message, kind = 'info') {
+    const element = document.getElementById('contact-subscription-status');
+    if (!element) return;
+    element.textContent = message || '';
+    element.className = `planner-subscription-status ${kind}`;
+  }
+
+  async function loadContactSubscriptions() {
+    try {
+      contactSubscriptionsState = await rpc('contacts.subscriptions.list') || [];
+      renderContactSubscriptions();
+    } catch (error) {
+      contactSubscriptionStatus(`${t('error')} : ${error.message}`, 'error');
+    }
+  }
+
+  async function openContactSubscriptions() {
+    openModal('contact-subscriptions-modal');
+    document.getElementById('contact-subscription-url').value = '';
+    document.getElementById('contact-subscription-name').value = '';
+    document.getElementById('contact-subscription-refresh').value = '30';
+    contactSubscriptionStatus('');
+    await loadContactSubscriptions();
+  }
+
+  async function addContactSubscription() {
+    const url = document.getElementById('contact-subscription-url').value.trim();
+    if (!url) return;
+    const name = document.getElementById('contact-subscription-name').value.trim();
+    const refreshMinutes = Number(document.getElementById('contact-subscription-refresh').value) || 0;
+    const button = document.getElementById('btn-contact-subscription-add');
+    button.disabled = true;
+    contactSubscriptionStatus(t('planner.subscriptionAdding'));
+    try {
+      const result = await rpc('contacts.subscriptions.add', { name, url, refreshMinutes });
+      document.getElementById('contact-subscription-url').value = '';
+      document.getElementById('contact-subscription-name').value = '';
+      contactSubscriptionStatus(
+        result.error ? t('planner.subscriptionAddedWithError', { error: result.error }) : t('planner.subscriptionAdded'),
+        result.error ? 'error' : 'success');
+      await loadContactSubscriptions();
+      await loadContacts({ preserveSelection: true });
+    } catch (error) {
+      contactSubscriptionStatus(`${t('error')} : ${error.message}`, 'error');
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function syncContactSubscriptionUI(id, button) {
+    if (button) button.disabled = true;
+    contactSubscriptionStatus(t('planner.subscriptionSyncing'));
+    try {
+      await rpc('contacts.subscriptions.sync', { id });
+      contactSubscriptionStatus(t('planner.subscriptionSynced'), 'success');
+      await loadContactSubscriptions();
+      await loadContacts({ preserveSelection: true });
+    } catch (error) {
+      contactSubscriptionStatus(`${t('error')} : ${error.message}`, 'error');
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  async function syncAllContactSubscriptionsUI() {
+    contactSubscriptionStatus(t('planner.subscriptionSyncing'));
+    try {
+      await rpc('contacts.subscriptions.syncAll');
+      contactSubscriptionStatus(t('planner.subscriptionSynced'), 'success');
+      await loadContactSubscriptions();
+      await loadContacts({ preserveSelection: true });
+    } catch (error) {
+      contactSubscriptionStatus(`${t('error')} : ${error.message}`, 'error');
+    }
+  }
+
+  async function removeContactSubscriptionUI(id) {
+    const accepted = await confirmAction({
+      title: t('planner.removeSubscription'),
+      message: t('contacts.removeSubscriptionConfirm'),
+      confirmLabel: t('planner.removeSubscriptionAction'),
+      danger: true,
+    });
+    if (!accepted) return;
+    try {
+      await rpc('contacts.subscriptions.remove', { id });
+      await loadContactSubscriptions();
+      await loadContacts({ preserveSelection: true });
+    } catch (error) {
+      contactSubscriptionStatus(`${t('error')} : ${error.message}`, 'error');
+    }
+  }
+
+  function resetContactEditor({ seed = null, focus = false } = {}) {
+    editingContactId = null;
+    document.getElementById('contact-id').value = '';
+    document.getElementById('contact-first-name').value = seed?.firstName || '';
+    document.getElementById('contact-last-name').value = seed?.lastName || '';
+    document.getElementById('contact-display-name').value = seed?.displayName || seed?.name || '';
+    document.getElementById('contact-company').value = seed?.company || '';
+    document.getElementById('contact-job-title').value = seed?.jobTitle || '';
+    document.getElementById('contact-emails').value = seed?.email || '';
+    document.getElementById('contact-phone').value = seed?.phone || '';
+    document.getElementById('contact-mobile').value = seed?.mobile || '';
+    document.getElementById('contact-birthday').value = seed?.birthday || '';
+    document.getElementById('contact-preferred-account').innerHTML = contactAccountOptions(seed?.preferredAccountId || '');
+    contactAvatarData = seed?.avatarData || '';
+    renderContactGroupAssignments(seed?.groups || []);
+    document.getElementById('contact-new-group').value = '';
+    document.getElementById('contact-address').value = seed?.postalAddress || '';
+    document.getElementById('contact-notes').value = seed?.notes || '';
+    document.getElementById('contact-trusted').checked = seed?.trusted !== false;
+    document.getElementById('contact-favorite').checked = Boolean(seed?.favorite);
+    document.getElementById('contact-form-error').textContent = '';
+    document.getElementById('btn-delete-contact').classList.add('hidden');
+    document.getElementById('contact-editor-heading').textContent = t('contacts.new');
+    document.getElementById('contact-editor-subtitle').textContent = seed?.email || '';
+    updateContactAvatarPreview(seed || {});
+    document.getElementById('contact-editor-empty').classList.add('hidden');
+    document.getElementById('contact-editor').classList.remove('hidden');
+    document.querySelectorAll('.contact-list-row').forEach(row => row.classList.remove('active'));
+    if (focus) setTimeout(() => document.getElementById(seed?.displayName ? 'contact-emails' : 'contact-display-name').focus(), 0);
+  }
+
+  function editContact(contact, { focus = false } = {}) {
+    if (!contact) return resetContactEditor({ focus });
+    editingContactId = Number(contact.id);
+    document.getElementById('contact-id').value = contact.id;
+    document.getElementById('contact-first-name').value = contact.firstName || '';
+    document.getElementById('contact-last-name').value = contact.lastName || '';
+    document.getElementById('contact-display-name').value = contact.displayName || '';
+    document.getElementById('contact-company').value = contact.company || '';
+    document.getElementById('contact-job-title').value = contact.jobTitle || '';
+    document.getElementById('contact-emails').value = (contact.emails || []).map(item =>
+      item.label ? `${item.email} | ${item.label}` : item.email).join('\n');
+    document.getElementById('contact-phone').value = contact.phone || '';
+    document.getElementById('contact-mobile').value = contact.mobile || '';
+    document.getElementById('contact-birthday').value = contact.birthday || '';
+    document.getElementById('contact-preferred-account').innerHTML = contactAccountOptions(contact.preferredAccountId || '');
+    contactAvatarData = contact.avatarData || '';
+    renderContactGroupAssignments(contact.groups || []);
+    document.getElementById('contact-new-group').value = '';
+    document.getElementById('contact-address').value = contact.postalAddress || '';
+    document.getElementById('contact-notes').value = contact.notes || '';
+    document.getElementById('contact-trusted').checked = Boolean(contact.trusted);
+    document.getElementById('contact-favorite').checked = Boolean(contact.favorite);
+    document.getElementById('contact-form-error').textContent = '';
+    document.getElementById('btn-delete-contact').classList.remove('hidden');
+    document.getElementById('contact-editor-heading').textContent = contact.displayName || contact.primaryEmail;
+    document.getElementById('contact-editor-subtitle').textContent = contact.primaryEmail || contact.company || '';
+    updateContactAvatarPreview(contact);
+    document.getElementById('contact-editor-empty').classList.add('hidden');
+    document.getElementById('contact-editor').classList.remove('hidden');
+    document.querySelectorAll('.contact-list-row').forEach(row => {
+      row.classList.toggle('active', Number(row.dataset.contactId) === Number(contact.id));
+    });
+    if (focus) setTimeout(() => document.getElementById('contact-display-name').focus(), 0);
+  }
+
+  function parseContactEmails(value) {
+    return String(value || '').split(/[\n;,]+/).map((line, index) => {
+      const [email, ...labelParts] = line.split('|');
+      return { email: email.trim(), label: labelParts.join('|').trim(), isPrimary: index === 0 };
+    }).filter(item => item.email);
+  }
+
+  function collectContactForm() {
+    return {
+      displayName: document.getElementById('contact-display-name').value,
+      firstName: document.getElementById('contact-first-name').value,
+      lastName: document.getElementById('contact-last-name').value,
+      company: document.getElementById('contact-company').value,
+      jobTitle: document.getElementById('contact-job-title').value,
+      emails: parseContactEmails(document.getElementById('contact-emails').value),
+      phone: document.getElementById('contact-phone').value,
+      mobile: document.getElementById('contact-mobile').value,
+      birthday: document.getElementById('contact-birthday').value,
+      preferredAccountId: document.getElementById('contact-preferred-account').value,
+      groups: selectedContactGroupNames(),
+      avatarData: contactAvatarData,
+      postalAddress: document.getElementById('contact-address').value,
+      notes: document.getElementById('contact-notes').value,
+      trusted: document.getElementById('contact-trusted').checked,
+      favorite: document.getElementById('contact-favorite').checked,
+    };
+  }
+
+  async function saveContact() {
+    const button = document.getElementById('btn-save-contact');
+    const errorElement = document.getElementById('contact-form-error');
+    errorElement.textContent = '';
+    button.disabled = true;
+    const wasEditing = Boolean(editingContactId);
+    try {
+      const result = await rpc('contacts.save', {
+        id: editingContactId || null,
+        contact: collectContactForm(),
+      });
+      editingContactId = result.contact.id;
+      await refreshContactDirectory();
+      await loadContacts({ preserveSelection: true });
+      updateCurrentCorrespondentFromContact(result.contact);
+      list.render(true);
+      status(t(wasEditing ? 'contacts.saved' : 'contacts.created'), 'success');
+      if (Number(result.clearedSpam) > 0) {
+        status(t('contacts.spamCleared', { count: result.clearedSpam }), 'success');
+        refresh().catch(() => {});
+      }
+    } catch (error) {
+      errorElement.textContent = error.message;
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function deleteContact() {
+    if (!editingContactId) return;
+    const contact = contactsCache.find(item => Number(item.id) === Number(editingContactId));
+    const accepted = await confirmAction({
+      title: t('contacts.deleteTitle'),
+      message: t('contacts.deleteConfirm', { name: contact?.displayName || contact?.primaryEmail || '' }),
+      confirmLabel: t('contacts.delete'),
+      icon: 'fa-user-xmark', danger: true,
+    });
+    if (!accepted) return;
+    await rpc('contacts.remove', { id: editingContactId });
+    editingContactId = null;
+    document.getElementById('contact-editor').classList.add('hidden');
+    document.getElementById('contact-editor-empty').classList.remove('hidden');
+    await loadContacts();
+    if (Viewer.current) refreshCurrentCorrespondentContact().catch(() => {});
+    status(t('contacts.deleted'), 'success');
+  }
+
+  async function openContacts({ contactId = null, seed = null } = {}) {
+    if (!contactId) editingContactId = null;
+    openModal('contacts-modal');
+    document.getElementById('contact-preferred-account').innerHTML = contactAccountOptions(seed?.preferredAccountId || '');
+    const result = await loadContacts();
+    if (contactId) {
+      const contact = result.rows.find(item => Number(item.id) === Number(contactId))
+        || await rpc('contacts.get', { id: contactId });
+      if (contact) editContact(contact);
+      else resetContactEditor({ seed, focus: true });
+    } else if (seed) {
+      resetContactEditor({ seed, focus: true });
+    } else {
+      document.getElementById('contact-editor').classList.add('hidden');
+      document.getElementById('contact-editor-empty').classList.remove('hidden');
+    }
+  }
+
+  function updateCurrentCorrespondentFromContact(contact) {
+    if (!Viewer.current?.correspondent?.email || !contact) return;
+    const matches = (contact.emails || []).some(item => item.email.toLowerCase() === Viewer.current.correspondent.email.toLowerCase());
+    if (!matches) return;
+    Viewer.current.correspondent.contact = contact;
+    updateReaderContactState(Viewer.current);
+  }
+
+  function updateReaderContactState(message) {
+    const button = document.getElementById('btn-r-contact');
+    const badge = document.getElementById('r-contact-badge');
+    const avatar = document.getElementById('r-contact-avatar');
+    const contact = message?.correspondent?.contact || null;
+    const email = message?.correspondent?.email || '';
+    const directoryContact = contactDirectoryEntry(email);
+    const displayName = contact?.displayName || directoryContact?.displayName || message?.correspondent?.name || email;
+    if (avatar) {
+      avatar.classList.toggle('hidden', !displayName && !email);
+      setAvatarElement(avatar, {
+        avatarData: contact?.avatarData || directoryContact?.avatarData || '',
+        initials: contactInitials({ displayName, email }),
+        fallbackColor: colorFrom(email || displayName || 'contact'),
+      });
+    }
+    button.dataset.contactId = contact?.id || '';
+    button.dataset.email = email;
+    button.querySelector('i').className = contact ? 'fa-solid fa-user-pen' : 'fa-solid fa-user-plus';
+    button.title = t(contact ? 'contacts.editSender' : 'contacts.addSender');
+    if (contact) {
+      badge.textContent = contact.displayName || contact.primaryEmail;
+      badge.classList.toggle('trusted', Boolean(contact.trusted));
+      badge.classList.remove('hidden');
+      badge.title = contact.trusted ? t('contacts.trustedContact') : t('contacts.knownContact');
+    } else {
+      badge.textContent = '';
+      badge.classList.add('hidden');
+      badge.classList.remove('trusted');
+    }
+  }
+
+  async function refreshCurrentCorrespondentContact() {
+    const message = Viewer.current;
+    const email = message?.correspondent?.email;
+    if (!message || !email) return;
+    message.correspondent.contact = await rpc('contacts.findByEmail', { email });
+    updateReaderContactState(message);
+  }
+
+  function openCurrentCorrespondentContact() {
+    const message = Viewer.current;
+    if (!message?.correspondent?.email) return;
+    const contact = message.correspondent.contact;
+    if (contact) {
+      openContacts({ contactId: contact.id });
+      return;
+    }
+    openContacts({ seed: {
+      displayName: message.correspondent.name || message.correspondent.email,
+      name: message.correspondent.name || '',
+      email: message.correspondent.email,
+      trusted: true,
+      preferredAccountId: message.meta?.account_id || '',
+    }});
+  }
+
+  function recipientQuery(value) {
+    const parts = String(value || '').split(/[,;]/);
+    return parts[parts.length - 1].trim().replace(/^.*<([^>]*)>?$/, '$1').trim();
+  }
+
+  function insertContactRecipient(input, suggestion) {
+    const value = input.value;
+    const separatorIndex = Math.max(value.lastIndexOf(','), value.lastIndexOf(';'));
+    const prefix = separatorIndex >= 0 ? value.slice(0, separatorIndex + 1) + ' ' : '';
+    const label = suggestion.type === 'group'
+      ? (suggestion.emails || []).join(', ')
+      : suggestion.displayName && suggestion.displayName !== suggestion.email
+        ? `${suggestion.displayName} <${suggestion.email}>`
+        : suggestion.email;
+    input.value = prefix + label + ', ';
+    if (suggestion.preferredAccountId
+        && accounts.some(account => String(account.id) === String(suggestion.preferredAccountId))) {
+      const from = document.getElementById('compose-from');
+      from.value = suggestion.preferredAccountId;
+      updateComposeSignature({ resetChoice: true });
+    }
+    hideContactSuggestions(input.id);
+    input.focus();
+  }
+
+  function suggestionContainer(inputId) {
+    const suffix = inputId === 'compose-bcc' ? 'bcc'
+      : inputId === 'compose-cc' ? 'cc'
+        : 'to';
+    return document.getElementById(`compose-${suffix}-suggestions`);
+  }
+
+  function hideContactSuggestions(inputId) {
+    const container = suggestionContainer(inputId);
+    if (container) {
+      container.classList.add('hidden');
+      container.innerHTML = '';
+    }
+    const state = contactSuggestionState.get(inputId);
+    if (state) state.index = -1;
+  }
+
+  function renderContactSuggestions(input, rows) {
+    const container = suggestionContainer(input.id);
+    const state = contactSuggestionState.get(input.id) || { rows: [], index: -1, timer: null };
+    state.rows = rows;
+    state.index = -1;
+    contactSuggestionState.set(input.id, state);
+    container.innerHTML = '';
+    if (!rows.length) return hideContactSuggestions(input.id);
+    rows.forEach((row, index) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'contact-suggestion';
+      button.dataset.suggestionIndex = index;
+      const group = row.type === 'group';
+      button.innerHTML = `
+        <span class="contact-suggestion-avatar">${group ? '<i class="fa-solid fa-user-group"></i>' : ''}</span>
+        <span class="contact-suggestion-main"><strong>${esc(row.displayName || row.email)}</strong><span>${group ? esc(t('contacts.groupRecipients', { count: row.emails?.length || 0 })) : esc(row.email) + (row.company ? ' · ' + esc(row.company) : '')}</span></span>
+        <span class="contact-suggestion-icons">${row.favorite ? '<i class="fa-solid fa-star"></i>' : ''}${row.trusted ? '<i class="fa-solid fa-shield-halved"></i>' : ''}</span>`;
+      if (group) {
+        button.querySelector('.contact-suggestion-avatar').style.backgroundColor = safeColor(row.color);
+      } else {
+        setAvatarElement(button.querySelector('.contact-suggestion-avatar'), {
+          avatarData: row.avatarData || '',
+          initials: contactInitials(row),
+          fallbackColor: colorFrom(row.email),
+        });
+      }
+      button.onmousedown = event => event.preventDefault();
+      button.onclick = () => insertContactRecipient(input, row);
+      container.appendChild(button);
+    });
+    container.classList.remove('hidden');
+  }
+
+  function updateSuggestionHighlight(inputId) {
+    const state = contactSuggestionState.get(inputId);
+    const container = suggestionContainer(inputId);
+    if (!state || !container) return;
+    container.querySelectorAll('.contact-suggestion').forEach((button, index) => {
+      button.classList.toggle('active', index === state.index);
+      if (index === state.index) button.scrollIntoView({ block: 'nearest' });
+    });
+  }
+
+  function wireContactAutocomplete(inputId) {
+    const input = document.getElementById(inputId);
+    const state = { rows: [], index: -1, timer: null };
+    contactSuggestionState.set(inputId, state);
+    input.addEventListener('input', () => {
+      clearTimeout(state.timer);
+      const query = recipientQuery(input.value);
+      if (query.length < 1) return hideContactSuggestions(inputId);
+      state.timer = setTimeout(async () => {
+        try {
+          const rows = await rpc('contacts.suggest', { query, limit: 12 });
+          if (recipientQuery(input.value) === query) renderContactSuggestions(input, rows);
+        } catch { hideContactSuggestions(inputId); }
+      }, 150);
+    });
+    input.addEventListener('keydown', event => {
+      const container = suggestionContainer(inputId);
+      if (container.classList.contains('hidden') || !state.rows.length) return;
+      if (event.key === 'ArrowDown') {
+        event.preventDefault(); state.index = (state.index + 1) % state.rows.length; updateSuggestionHighlight(inputId);
+      } else if (event.key === 'ArrowUp') {
+        event.preventDefault(); state.index = (state.index - 1 + state.rows.length) % state.rows.length; updateSuggestionHighlight(inputId);
+      } else if (event.key === 'Enter' && state.index >= 0) {
+        event.preventDefault(); insertContactRecipient(input, state.rows[state.index]);
+      } else if (event.key === 'Escape') {
+        hideContactSuggestions(inputId);
+      }
+    });
+    input.addEventListener('blur', () => setTimeout(() => hideContactSuggestions(inputId), 160));
+  }
+
+  // ---------- Confirmations et actions de dossier ----------
+  function messageParty(name, address) {
+    const cleanName = String(name || '').trim();
+    const cleanAddress = String(address || '').trim();
+    if (cleanName && cleanAddress && !cleanName.toLowerCase().includes(cleanAddress.toLowerCase())) {
+      return `${cleanName} <${cleanAddress}>`;
+    }
+    return cleanName || cleanAddress;
+  }
+
+  function deletionDetailsFromRow(row) {
+    if (!row) return null;
+    const isThread = Boolean(row.is_thread && !row.is_thread_child);
+    const outgoing = row.folder_role === 'sent' || row.display_mode === 'sent';
+    const account = accounts.find(item => item.id === row.account_id);
+    let correspondent = '';
+    let correspondentLabel = '';
+
+    if (isThread && row.participants) {
+      correspondent = row.participants;
+      correspondentLabel = t('trash.detailParticipants');
+    } else if (outgoing) {
+      correspondent = String(row.to_addr || '').trim();
+      correspondentLabel = t('trash.detailTo');
+    } else {
+      correspondent = messageParty(row.contact_name || row.from_name, row.from_addr);
+      correspondentLabel = t('trash.detailFrom');
+    }
+
+    return {
+      kind: isThread ? 'conversation' : 'message',
+      count: isThread ? Number(row.thread_count || 1) : 1,
+      subject: String(row.subject || '').trim() || t('mail.noSubject'),
+      correspondent,
+      correspondentLabel,
+      date: row.date ? fmtDateTime(row.date) : '',
+      account: account?.displayName || account?.email || '',
+    };
+  }
+
+  function renderConfirmActionDetails(details) {
+    const box = document.getElementById('confirm-action-details');
+    if (!box) return;
+    if (!details) {
+      box.innerHTML = '';
+      box.className = 'confirm-action-details hidden';
+      return;
+    }
+
+    if (details.kind === 'link') {
+      const rows = [];
+      if (details.domain) rows.push([t('link.domain'), details.domain]);
+      if (details.protocol) rows.push([t('link.protocol'), details.protocol]);
+      if (details.displayText && details.displayText !== details.url) {
+        rows.push([t('link.displayedText'), details.displayText]);
+      }
+      box.className = `confirm-action-details link-details${details.suspicious ? ' suspicious' : ''}`;
+      box.innerHTML = `
+        <div class="confirm-action-details-heading">
+          <i class="fa-solid fa-arrow-up-right-from-square"></i>
+          <span>${esc(t('link.destination'))}</span>
+        </div>
+        <div class="confirm-action-link-url" title="${esc(details.url)}">${esc(details.url)}</div>
+        ${rows.length ? `<dl>${rows.map(([label, value]) => `
+          <div><dt>${esc(label)}</dt><dd title="${esc(value)}">${esc(value)}</dd></div>`).join('')}</dl>` : ''}
+        ${details.suspicious ? `<div class="confirm-action-link-warning">
+          <i class="fa-solid fa-triangle-exclamation"></i>
+          <span>${esc(details.warning || t('link.suspicious'))}</span>
+        </div>` : ''}`;
+      return;
+    }
+
+    if (details.kind === 'certificate') {
+      const rows = [];
+      if (details.issuer) rows.push([t('account.cert.issuer'), details.issuer]);
+      rows.push([t('account.cert.validity'), `${details.validFrom || '?'} → ${details.validTo || '?'}`]);
+      if (details.fingerprint256) rows.push([t('account.cert.fingerprint'), details.fingerprint256]);
+      box.className = `confirm-action-details link-details${details.selfSigned ? ' suspicious' : ''}`;
+      box.innerHTML = `
+        <div class="confirm-action-details-heading">
+          <i class="fa-solid fa-lock"></i>
+          <span>${esc(details.subject || details.host || '')}</span>
+        </div>
+        ${rows.length ? `<dl>${rows.map(([label, value]) => `
+          <div><dt>${esc(label)}</dt><dd title="${esc(value)}">${esc(value)}</dd></div>`).join('')}</dl>` : ''}
+        <div class="confirm-action-link-warning">
+          <i class="fa-solid fa-triangle-exclamation"></i>
+          <span>${esc(t('account.cert.warning'))}</span>
+        </div>`;
+      return;
+    }
+
+    const heading = details.kind === 'conversation'
+      ? t('trash.affectedConversation', { count: details.count || 1 })
+      : t('trash.affectedMessage');
+    const rows = [];
+    if (details.correspondent) rows.push([details.correspondentLabel || t('trash.detailFrom'), details.correspondent]);
+    if (details.date) rows.push([t('trash.detailDate'), details.date]);
+    if (details.account) rows.push([t('trash.detailAccount'), details.account]);
+
+    box.className = 'confirm-action-details';
+    box.innerHTML = `
+      <div class="confirm-action-details-heading">
+        <i class="fa-regular ${details.kind === 'conversation' ? 'fa-comments' : 'fa-envelope'}"></i>
+        <span>${esc(heading)}</span>
+      </div>
+      <div class="confirm-action-details-subject" title="${esc(details.subject)}">${esc(details.subject)}</div>
+      ${rows.length ? `<dl>${rows.map(([label, value]) => `
+        <div><dt>${esc(label)}</dt><dd>${esc(value)}</dd></div>`).join('')}</dl>` : ''}`;
+  }
+
+  function confirmAction({
+    title,
+    message,
+    confirmLabel,
+    icon = 'fa-triangle-exclamation',
+    danger = true,
+    note = t('trash.serverNote'),
+    details = null,
+  }) {
+    return new Promise(resolve => {
+      pendingConfirmAction = resolve;
+      document.getElementById('confirm-action-title').textContent = title;
+      document.getElementById('confirm-action-message').textContent = message;
+      document.getElementById('confirm-action-icon').className = `fa-solid ${icon}`;
+      renderConfirmActionDetails(details);
+      const noteBox = document.getElementById('confirm-action-note');
+      const noteText = document.getElementById('confirm-action-note-text');
+      if (noteBox && noteText) {
+        noteText.textContent = note || '';
+        noteBox.classList.toggle('hidden', !note);
+      }
+      const button = document.getElementById('btn-confirm-action');
+      button.classList.toggle('danger', danger);
+      button.classList.toggle('primary', !danger);
+      button.querySelector('span').textContent = confirmLabel;
+      openModal('confirm-action-modal');
+    });
+  }
+
+  function resolveConfirmAction(accepted) {
+    const resolve = pendingConfirmAction;
+    pendingConfirmAction = null;
+    document.getElementById('confirm-action-modal').classList.remove('open');
+    if (resolve) resolve(Boolean(accepted));
+  }
+
+  // Confirmation explicite d'un certificat serveur non reconnu (auto-signé ou
+  // émis par une autorité privée) avant de l'épingler pour ce compte. Seul ce
+  // certificat exact sera ensuite accepté ; toute substitution ultérieure
+  // reste rejetée (voir engine/lib/cert_trust.js).
+  function confirmCertificateTrust(protocol, certDetails) {
+    return confirmAction({
+      title: t('account.cert.title'),
+      message: t('account.cert.message', { protocol: String(protocol || '').toUpperCase() }),
+      confirmLabel: t('account.cert.accept'),
+      icon: 'fa-lock',
+      danger: true,
+      note: t('account.cert.note'),
+      details: { kind: 'certificate', ...certDetails },
+    });
+  }
+
+  async function emptyCurrentFolder() {
+    if (!['spam', 'trash'].includes(view.type)) return;
+    const trash = view.type === 'trash';
+    const accepted = await confirmAction({
+      title: t(trash ? 'trash.emptyTitle' : 'spam.emptyTitle'),
+      message: t(trash ? 'trash.emptyConfirm' : 'spam.emptyConfirm'),
+      confirmLabel: t(trash ? 'trash.empty' : 'spam.empty'),
+      icon: trash ? 'fa-trash-can' : 'fa-broom',
+      danger: true,
+    });
+    if (!accepted) return;
+    try {
+      await rpc(trash ? 'trash.empty' : 'spam.empty');
+      clearReader();
+      await refresh();
+      await refreshSpamStats();
+    } catch (error) {
+      status(`${t('error')} : ${error.message}`, 'error');
+    }
+  }
+
+  // ---------- Actions ----------
+  async function quickAction(row, action, sourceElement = null) {
+    if (action !== 'label') closeQuickLabelMenu();
+    if (action === 'toggle-thread') {
+      // FARO Mail 0.2.24 UI v18 — action dédiée émise par la flèche.
+      await toggleConversation(row);
+    } else if (action === 'seen') {
+      const unread = row.is_thread ? Number(row.thread_unread) > 0 : !row.seen;
+      await setSeenState(row, unread);
+    } else if (action === 'restore') {
+      const restoredItems = [selectionItemFromRow(row)];
+      const result = await rpc('messages.batchRestore', { items: restoredItems });
+      const errorCount = Array.isArray(result.errors) ? result.errors.length : 0;
+      if (!Number(result.processed) && errorCount) {
+        status(`${t('error')} : ${result.errors[0].error}`, 'error');
+        return;
+      }
+      status(errorCount
+        ? t('trash.restorePartial', { count: Number(result.processed || 0), errors: errorCount })
+        : t('trash.restoreSuccess', { count: Number(result.processed || 0) }),
+      errorCount ? 'error' : 'success');
+      closeReaderTabsForItems(restoredItems);
+      clearReader();
+      await refreshVisibleList({ preserveListState: true });
+    } else if (action === 'delete') {
+      const permanent = row.folder_role === 'trash';
+      const accepted = await confirmAction({
+        title: t(permanent ? 'trash.deleteTitle' : 'trash.moveTitle'),
+        message: t(permanent ? 'trash.deleteMessage' : 'trash.moveMessage'),
+        confirmLabel: t(permanent ? 'trash.deletePermanent' : 'trash.move'),
+        icon: 'fa-trash-can',
+        danger: permanent,
+        details: deletionDetailsFromRow(row),
+      });
+      if (!accepted) return;
+      const deletedItems = [selectionItemFromRow(row)];
+      await rpc('messages.batchDelete', { items: deletedItems });
+      closeReaderTabsForItems(deletedItems);
+      clearReader();
+      await refreshVisibleList({ preserveListState: true });
+      if (!permanent) offerUndoDelete(deletedItems, deletedItems.reduce((sum, item) => sum + (item.count || 1), 0));
+    } else if (action === 'label') {
+      await toggleQuickLabelMenu(row, sourceElement);
+    } else if (action === 'spam') {
+      const markingSpam = view.type !== 'spam';
+      const spamItems = [selectionItemFromRow(row)];
+      const result = await rpc('messages.batchMarkSpam', {
+        items: spamItems,
+        isSpam: markingSpam,
+      });
+      if (!Number(result.processed) && result.errors?.length) {
+        status(`${t('error')} : ${result.errors[0].error}`, 'error');
+        return;
+      }
+      clearReader();
+      await refresh();
+      await refreshSpamStats();
+      offerUndoSpam(spamItems, Number(result.processed) || 1, markingSpam);
+    } else if (action === 'flag') {
+      const value = row.flagged ? 0 : 1;
+      if (row.is_thread && !row.is_thread_child) {
+        await rpc('messages.batchSetFlag', {
+          items: [selectionItemFromRow(row)], flag: 'flagged', value: Boolean(value),
+        });
+        list.patchThread(row.thread_key, { flagged: value });
+      } else {
+        await rpc('messages.setFlag', { id: row.id, flag: 'flagged', value: Boolean(value) });
+        list.patchRow(row.id, { flagged: value });
+      }
+      updateReaderTabsFlag(row, { flagged: value });
+      if (Viewer.current?.meta?.id === row.id) {
+        Viewer.current.meta.flagged = value;
+        document.getElementById('btn-r-flag').querySelector('i').className =
+          value ? 'fa-solid fa-star' : 'fa-regular fa-star';
+      }
+    } else if (action === 'reply') {
+      openCompose(row, 'reply');
+    } else if (action === 'reply-all') {
+      openCompose(row, 'reply-all');
+    }
+  }
+
+  // Une suppression qui déplace réellement vers la corbeille reste réversible
+  // (contrairement à une suppression déjà lancée depuis la corbeille, qui
+  // détruit le message). L'action « Annuler » réutilise le même mécanisme que
+  // le bouton de restauration manuel de la corbeille.
+  function offerUndoDelete(items, count) {
+    showToast({
+      icon: 'fa-trash-can',
+      message: t('undo.moved', { count }),
+      actionLabel: t('undo.action'),
+      onAction: async () => {
+        try {
+          await rpc('messages.batchRestore', { items });
+          await refreshVisibleList({ preserveListState: true });
+          status(t('trash.restoreSuccess', { count }), 'success');
+        } catch (error) {
+          status(`${t('error')} : ${error.message}`, 'error');
+        }
+      },
+    });
+  }
+
+  function offerUndoSpam(items, count, markedAsSpam) {
+    showToast({
+      icon: 'fa-ban',
+      message: t(markedAsSpam ? 'undo.markedSpam' : 'undo.unmarkedSpam', { count }),
+      actionLabel: t('undo.action'),
+      onAction: async () => {
+        try {
+          await rpc('messages.batchMarkSpam', { items, isSpam: !markedAsSpam });
+          await refresh();
+          await refreshSpamStats();
+        } catch (error) {
+          status(`${t('error')} : ${error.message}`, 'error');
+        }
+      },
+    });
+  }
+
+  // ---------- Sélection multiple ----------
+  function selectionItemFromRow(row) {
+    const isThread = Boolean(row?.is_thread && !row?.is_thread_child);
+    return {
+      type: isThread ? 'thread' : 'message',
+      id: row?.id,
+      threadKey: isThread ? row.thread_key : null,
+      folderRole: row?.folder_role || '',
+      isSpam: Boolean(row?.is_spam),
+      seen: isThread ? Number(row?.thread_unread || 0) === 0 : Boolean(row?.seen),
+      flagged: Boolean(row?.flagged),
+      count: isThread ? Number(row?.thread_count || 1) : 1,
+    };
+  }
+
+  function selectionPayload(items = bulkSelection) {
+    return (items || []).map(item => ({
+      type: item.type,
+      id: Number(item.id),
+      threadKey: item.threadKey || undefined,
+    }));
+  }
+
+  function closeBulkLabelMenu() {
+    document.getElementById('bulk-label-menu')?.classList.add('hidden');
+  }
+
+  function closeQuickLabelMenu() {
+    quickLabelRequestToken += 1;
+    quickLabelContext = null;
+    const menu = document.getElementById('quick-label-menu');
+    if (!menu) return;
+    menu.classList.add('hidden');
+    menu.innerHTML = '';
+    menu.style.removeProperty('left');
+    menu.style.removeProperty('top');
+  }
+
+  function quickLabelItemKey(item) {
+    return item?.type === 'thread'
+      ? `thread:${item.threadKey || ''}`
+      : `message:${item?.id || ''}`;
+  }
+
+  function positionQuickLabelMenu(anchor) {
+    const menu = document.getElementById('quick-label-menu');
+    if (!menu || menu.classList.contains('hidden') || !anchor?.isConnected) return;
+    const rect = anchor.getBoundingClientRect();
+    const margin = 8;
+    const width = Math.max(220, Math.min(menu.offsetWidth || 220, window.innerWidth - margin * 2));
+    const height = Math.min(menu.scrollHeight || 300, 300);
+    let left = rect.right - width;
+    left = Math.max(margin, Math.min(left, window.innerWidth - width - margin));
+    let top = rect.bottom + 5;
+    if (top + height > window.innerHeight - margin) top = Math.max(margin, rect.top - height - 5);
+    menu.style.left = `${Math.round(left)}px`;
+    menu.style.top = `${Math.round(top)}px`;
+  }
+
+  async function renderQuickLabelMenu(context, token) {
+    const menu = document.getElementById('quick-label-menu');
+    const labels = await rpc('labels.selectionState', { items: selectionPayload([context.item]) });
+    if (token !== quickLabelRequestToken || quickLabelContext !== context) return;
+
+    menu.innerHTML = '';
+    if (!labels.length) {
+      menu.innerHTML = `<div class="empty-hint">${esc(t('selection.noLabels'))}</div>`;
+      positionQuickLabelMenu(context.anchor);
+      return;
+    }
+
+    for (const label of labels) {
+      const applied = Number(label.applied_count) > 0;
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'side-item';
+      button.setAttribute('role', 'menuitemcheckbox');
+      button.setAttribute('aria-checked', applied ? 'true' : 'false');
+      button.innerHTML = `
+        <span class="account-dot" style="background:${safeColor(label.color)}"></span>
+        <span style="overflow:hidden;text-overflow:ellipsis">${esc(label.name)}</span>
+        <span class="label-selection-state ${applied ? 'all' : ''}">
+          <i class="fa-solid ${applied ? 'fa-check' : 'fa-plus'}"></i>
+        </span>`;
+      button.title = t(applied ? 'selection.removeLabel' : 'selection.addLabel', { label: label.name });
+      button.onclick = async event => {
+        event.stopPropagation();
+        if (quickLabelContext !== context) return;
+        button.disabled = true;
+        try {
+          const result = await rpc('labels.batchSet', {
+            items: selectionPayload([context.item]),
+            labelId: label.id,
+            applied: !applied,
+          });
+          closeQuickLabelMenu();
+          status(t('selection.labelProcessed', { count: result.processed || 0 }), 'success');
+          renderLabels(await rpc('labels.list'));
+          await refreshVisibleList({ preserveListState: true });
+        } catch (error) {
+          status(`${t('error')} : ${error.message}`, 'error');
+          button.disabled = false;
+        }
+      };
+      menu.appendChild(button);
+    }
+    positionQuickLabelMenu(context.anchor);
+  }
+
+  async function toggleQuickLabelMenu(row, anchor) {
+    if (!row || !anchor) return;
+    const item = selectionItemFromRow(row);
+    const key = quickLabelItemKey(item);
+    const menu = document.getElementById('quick-label-menu');
+    if (quickLabelContext?.key === key && !menu.classList.contains('hidden')) {
+      closeQuickLabelMenu();
+      return;
+    }
+
+    closeBulkLabelMenu();
+    document.getElementById('label-menu')?.classList.add('hidden');
+    const token = ++quickLabelRequestToken;
+    const context = { key, item, anchor };
+    quickLabelContext = context;
+    menu.innerHTML = `<div class="empty-hint"><i class="fa-solid fa-rotate fa-spin"></i> ${esc(t('selection.loadingLabels'))}</div>`;
+    menu.classList.remove('hidden');
+    positionQuickLabelMenu(anchor);
+    try {
+      await renderQuickLabelMenu(context, token);
+    } catch (error) {
+      if (token !== quickLabelRequestToken || quickLabelContext !== context) return;
+      menu.innerHTML = `<div class="empty-hint">${esc(error.message)}</div>`;
+      positionQuickLabelMenu(anchor);
+    }
+  }
+
+  function updateBulkSelection(items, meta = {}) {
+    bulkSelection = Array.isArray(items) ? items : [];
+    bulkSelectionMeta = {
+      total: Number(meta.total) || 0,
+      allSelected: Boolean(meta.allSelected),
+    };
+
+    const count = bulkSelection.length;
+    const messageCount = bulkSelection.reduce((total, item) => total + Math.max(1, Number(item.count) || 1), 0);
+    const toolbar = document.getElementById('bulk-actions');
+    toolbar.classList.toggle('hidden', count === 0);
+    const bulkCount = document.getElementById('bulk-count');
+    bulkCount.textContent = count ? t('selection.count', { count }) : '0';
+    bulkCount.title = count ? t('selection.countDetails', { count, messages: messageCount }) : '';
+
+    const selectAll = document.getElementById('btn-select-all');
+    const selectIcon = selectAll.querySelector('i');
+    selectAll.classList.toggle('active', count > 0);
+    selectAll.setAttribute('aria-pressed', bulkSelectionMeta.allSelected ? 'true' : 'false');
+    selectIcon.className = bulkSelectionMeta.allSelected
+      ? 'fa-solid fa-square-check'
+      : count > 0
+        ? 'fa-solid fa-square-minus'
+        : 'fa-regular fa-square';
+    selectAll.title = t(bulkSelectionMeta.allSelected ? 'selection.clearAll' : 'selection.selectAll');
+
+    if (!count) {
+      closeBulkLabelMenu();
+      return;
+    }
+
+    const allFlagged = bulkSelection.every(item => item.flagged);
+    const flagButton = document.getElementById('btn-bulk-flag');
+    flagButton.dataset.value = allFlagged ? '0' : '1';
+    flagButton.querySelector('i').className = allFlagged ? 'fa-solid fa-star' : 'fa-regular fa-star';
+    flagButton.title = t(allFlagged ? 'selection.unflag' : 'selection.flag');
+
+    const eligibleSpam = bulkSelection.filter(item => !['sent', 'trash'].includes(item.folderRole));
+    const spamButton = document.getElementById('btn-bulk-spam');
+    const removeSpam = eligibleSpam.length > 0 && eligibleSpam.every(item => item.isSpam);
+    spamButton.disabled = eligibleSpam.length === 0;
+    spamButton.dataset.isSpam = removeSpam ? '0' : '1';
+    spamButton.querySelector('i').className = removeSpam ? 'fa-solid fa-shield' : 'fa-solid fa-ban';
+    spamButton.title = t(removeSpam ? 'action.notspam' : 'action.spam');
+
+    const restoreButton = document.getElementById('btn-bulk-restore');
+    const restorable = bulkSelection.length > 0 && bulkSelection.every(item => item.folderRole === 'trash');
+    restoreButton.classList.toggle('hidden', !restorable);
+    restoreButton.disabled = !restorable;
+    restoreButton.title = t('selection.restore');
+
+    const deleteButton = document.getElementById('btn-bulk-delete');
+    const permanent = bulkSelection.every(item => item.folderRole === 'trash');
+    deleteButton.title = t(permanent ? 'trash.deletePermanent' : 'selection.delete');
+  }
+
+  async function runBulkFlag(flag, value) {
+    if (!bulkSelection.length) return;
+    try {
+      const result = await rpc('messages.batchSetFlag', {
+        items: selectionPayload(), flag, value: Boolean(value),
+      });
+      const errorCount = Array.isArray(result.errors) ? result.errors.length : 0;
+      status(errorCount
+        ? t('contacts.spamSkippedTrusted', { processed: result.processed || 0, skipped: errorCount })
+        : t('selection.processed', { count: result.processed || 0 }),
+      errorCount ? 'error' : 'success');
+      clearReader();
+      await refresh();
+    } catch (error) {
+      status(`${t('error')} : ${error.message}`, 'error');
+    }
+  }
+
+  async function runBulkRestore() {
+    if (!bulkSelection.length || !bulkSelection.every(item => item.folderRole === 'trash')) return;
+    const selectedCount = bulkSelection.length;
+    const accepted = await confirmAction({
+      title: t('selection.restoreTitle'),
+      message: t('selection.restoreMessage', { count: selectedCount }),
+      confirmLabel: t('trash.restore'),
+      icon: 'fa-rotate-left',
+    });
+    if (!accepted) return;
+    try {
+      const restoredItems = selectionPayload();
+      const result = await rpc('messages.batchRestore', { items: restoredItems });
+      const errorCount = Array.isArray(result.errors) ? result.errors.length : 0;
+      status(errorCount
+        ? t('trash.restorePartial', { count: Number(result.processed || 0), errors: errorCount })
+        : t('trash.restoreSuccess', { count: Number(result.processed || 0) }),
+      errorCount ? 'error' : 'success');
+      closeReaderTabsForItems(restoredItems);
+      clearReader();
+      await refreshVisibleList({ preserveListState: true });
+    } catch (error) {
+      status(`${t('error')} : ${error.message}`, 'error');
+    }
+  }
+
+  async function runBulkDelete() {
+    if (!bulkSelection.length) return;
+    const selectedCount = bulkSelection.length;
+    const hasPermanent = bulkSelection.some(item => item.folderRole === 'trash');
+    const accepted = await confirmAction({
+      title: t('selection.deleteTitle', { count: selectedCount }),
+      message: t(hasPermanent ? 'selection.deleteMixedMessage' : 'selection.deleteMessage', { count: selectedCount }),
+      confirmLabel: t('selection.delete'),
+      icon: 'fa-trash-can',
+      danger: true,
+    });
+    if (!accepted) return;
+    try {
+      const deletedItems = selectionPayload();
+      const result = await rpc('messages.batchDelete', { items: deletedItems });
+      closeReaderTabsForItems(deletedItems);
+      const errorCount = Array.isArray(result.errors) ? result.errors.length : 0;
+      status(errorCount
+        ? t('contacts.spamSkippedTrusted', { processed: result.processed || 0, skipped: errorCount })
+        : t('selection.processed', { count: result.processed || 0 }),
+      errorCount ? 'error' : 'success');
+      clearReader();
+      await refreshVisibleList({ preserveListState: true });
+      if (!hasPermanent) offerUndoDelete(deletedItems, Number(result.processed) || deletedItems.length);
+    } catch (error) {
+      status(`${t('error')} : ${error.message}`, 'error');
+    }
+  }
+
+  async function runBulkSpam() {
+    if (!bulkSelection.length) return;
+    const button = document.getElementById('btn-bulk-spam');
+    if (button.disabled) return;
+    const isSpam = button.dataset.isSpam !== '0';
+    const accepted = await confirmAction({
+      title: t(isSpam ? 'selection.spamTitle' : 'selection.notSpamTitle'),
+      message: t(isSpam ? 'selection.spamMessage' : 'selection.notSpamMessage', { count: bulkSelection.length }),
+      confirmLabel: t(isSpam ? 'action.spam' : 'action.notspam'),
+      icon: isSpam ? 'fa-ban' : 'fa-shield',
+      danger: isSpam,
+    });
+    if (!accepted) return;
+    try {
+      const spamItems = selectionPayload();
+      const result = await rpc('messages.batchMarkSpam', {
+        items: spamItems, isSpam,
+      });
+      const errorCount = Array.isArray(result.errors) ? result.errors.length : 0;
+      status(errorCount
+        ? t('contacts.spamSkippedTrusted', { processed: result.processed || 0, skipped: errorCount })
+        : t('selection.processed', { count: result.processed || 0 }),
+      errorCount ? 'error' : 'success');
+      clearReader();
+      await refresh();
+      await refreshSpamStats();
+      if (Number(result.processed) > 0) offerUndoSpam(spamItems, Number(result.processed), isSpam);
+    } catch (error) {
+      status(`${t('error')} : ${error.message}`, 'error');
+    }
+  }
+
+  async function renderBulkLabelMenu() {
+    const menu = document.getElementById('bulk-label-menu');
+    menu.innerHTML = `<div class="empty-hint"><i class="fa-solid fa-rotate fa-spin"></i> ${esc(t('selection.loadingLabels'))}</div>`;
+    const labels = await rpc('labels.selectionState', { items: selectionPayload() });
+    menu.innerHTML = '';
+    if (!labels.length) {
+      menu.innerHTML = `<div class="empty-hint">${esc(t('selection.noLabels'))}</div>`;
+      return;
+    }
+    for (const label of labels) {
+      const applied = Number(label.applied_count) || 0;
+      const total = Number(label.selected_count) || 0;
+      const all = total > 0 && applied === total;
+      const partial = applied > 0 && applied < total;
+      const button = document.createElement('button');
+      button.className = 'side-item';
+      button.innerHTML = `
+        <span class="account-dot" style="background:${safeColor(label.color)}"></span>
+        <span style="overflow:hidden;text-overflow:ellipsis">${esc(label.name)}</span>
+        <span class="label-selection-state ${all ? 'all' : partial ? 'partial' : ''}">
+          <i class="fa-solid ${all ? 'fa-check' : partial ? 'fa-minus' : 'fa-plus'}"></i>
+        </span>`;
+      button.title = t(all ? 'selection.removeLabel' : 'selection.addLabel', { label: label.name });
+      button.onclick = async event => {
+        event.stopPropagation();
+        try {
+          const result = await rpc('labels.batchSet', {
+            items: selectionPayload(),
+            labelId: label.id,
+            applied: !all,
+          });
+          closeBulkLabelMenu();
+          status(t('selection.labelProcessed', { count: result.processed || 0 }), 'success');
+          renderLabels(await rpc('labels.list'));
+          await refreshVisibleList({ preserveListState: true });
+        } catch (error) {
+          status(`${t('error')} : ${error.message}`, 'error');
+        }
+      };
+      menu.appendChild(button);
+    }
+  }
+
+  async function toggleBulkLabelMenu(event) {
+    event.stopPropagation();
+    if (!bulkSelection.length) return;
+    closeQuickLabelMenu();
+    const menu = document.getElementById('bulk-label-menu');
+    if (menu.classList.contains('hidden')) {
+      menu.classList.remove('hidden');
+      try { await renderBulkLabelMenu(); }
+      catch (error) {
+        menu.innerHTML = `<div class="empty-hint">${esc(error.message)}</div>`;
+      }
+    } else {
+      menu.classList.add('hidden');
+    }
+  }
+
+  // ---------- Étiquettes ----------
+  function normalizeLabelColor(value) {
+    const raw = String(value || '').trim();
+    if (/^#[0-9a-f]{6}$/i.test(raw)) return raw.toLowerCase();
+    if (/^#[0-9a-f]{3}$/i.test(raw)) {
+      return '#' + raw.slice(1).split('').map(character => character + character).join('').toLowerCase();
+    }
+    return null;
+  }
+
+  function setLabelColor(value) {
+    const color = normalizeLabelColor(value) || '#8b7dd8';
+    document.getElementById('label-color-picker').value = color;
+    document.getElementById('label-color-hex').value = color.toUpperCase();
+    document.querySelectorAll('#label-color-presets [data-label-color]').forEach(button => {
+      button.classList.toggle('selected', button.dataset.labelColor.toLowerCase() === color);
+    });
+  }
+
+  function clearLabelError() {
+    const error = document.getElementById('label-form-error');
+    error.textContent = '';
+    error.classList.remove('visible');
+  }
+
+  function showLabelError(message) {
+    const error = document.getElementById('label-form-error');
+    error.textContent = message;
+    error.classList.add('visible');
+  }
+
+  function resetLabelEditor({ focus = false } = {}) {
+    editingLabelId = null;
+    clearLabelError();
+    document.getElementById('label-name').value = '';
+    setLabelColor('#8b7dd8');
+    document.getElementById('btn-save-label').innerHTML =
+      `<i class="fa-solid fa-plus"></i><span>${esc(t('label.create'))}</span>`;
+    document.getElementById('btn-cancel-label-edit').classList.add('hidden');
+    document.getElementById('label-editor-title').textContent = t('label.new');
+    document.querySelectorAll('.label-manager-row').forEach(row => row.classList.remove('editing'));
+    if (focus) setTimeout(() => document.getElementById('label-name').focus(), 30);
+  }
+
+  function startLabelEdit(labelId) {
+    const label = currentLabels.find(item => String(item.id) === String(labelId));
+    if (!label) return;
+    editingLabelId = label.id;
+    pendingLabelDeleteId = null;
+    clearLabelError();
+    document.getElementById('label-name').value = label.name;
+    setLabelColor(label.color);
+    document.getElementById('btn-save-label').innerHTML =
+      `<i class="fa-solid fa-floppy-disk"></i><span>${esc(t('label.update'))}</span>`;
+    document.getElementById('btn-cancel-label-edit').classList.remove('hidden');
+    document.getElementById('label-editor-title').textContent = t('label.edit');
+    renderLabelManagerList(currentLabels);
+    setTimeout(() => {
+      const input = document.getElementById('label-name');
+      input.focus();
+      input.select();
+    }, 20);
+  }
+
+  function renderLabelColorPresets() {
+    const presets = document.getElementById('label-color-presets');
+    presets.innerHTML = '';
+    for (const color of LABEL_COLORS) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'label-color-preset';
+      button.dataset.labelColor = color;
+      button.style.background = color;
+      button.title = color.toUpperCase();
+      button.setAttribute('aria-label', `${t('label.color')} ${color}`);
+      button.onclick = () => setLabelColor(color);
+      presets.appendChild(button);
+    }
+  }
+
+  function renderLabelManagerList(labels) {
+    const container = document.getElementById('label-manager-list');
+    container.innerHTML = '';
+    if (!labels.length) {
+      container.innerHTML = `<div class="label-manager-empty">
+        <i class="fa-solid fa-tags"></i>
+        <span>${esc(t('label.noLabels'))}</span>
+      </div>`;
+      return;
+    }
+
+    for (const label of labels) {
+      const row = document.createElement('div');
+      row.className = 'label-manager-row';
+      row.dataset.labelRow = String(label.id);
+      if (String(editingLabelId) === String(label.id)) row.classList.add('editing');
+      const count = Number(label.message_count || 0);
+      const isConfirming = String(pendingLabelDeleteId) === String(label.id);
+      row.innerHTML = `
+        <span class="label-manager-swatch" style="background:${safeColor(label.color)}"></span>
+        <div class="label-manager-info">
+          <strong>${esc(label.name)}</strong>
+          <span>${esc(t('label.messageCount', { count }))}</span>
+        </div>
+        <div class="label-manager-actions ${isConfirming ? 'confirming' : ''}">
+          ${isConfirming ? `
+            <span class="label-delete-question">${esc(t('label.deleteConfirm'))}</span>
+            <button class="btn danger compact" type="button" data-label-delete-confirm="${label.id}">
+              <i class="fa-solid fa-trash"></i>${esc(t('label.deleteYes'))}
+            </button>
+            <button class="btn compact" type="button" data-label-delete-cancel="${label.id}">${esc(t('cancel'))}</button>
+          ` : `
+            <button class="iconbtn" type="button" data-label-edit="${label.id}" title="${esc(t('label.edit'))}">
+              <i class="fa-solid fa-pen"></i>
+            </button>
+            <button class="iconbtn label-delete-btn" type="button" data-label-delete="${label.id}" title="${esc(t('label.delete'))}">
+              <i class="fa-solid fa-trash"></i>
+            </button>
+          `}
+        </div>`;
+      container.appendChild(row);
+    }
+
+    container.querySelectorAll('[data-label-edit]').forEach(button => {
+      button.onclick = () => startLabelEdit(button.dataset.labelEdit);
+    });
+    container.querySelectorAll('[data-label-delete]').forEach(button => {
+      button.onclick = () => {
+        pendingLabelDeleteId = button.dataset.labelDelete;
+        renderLabelManagerList(currentLabels);
+      };
+    });
+    container.querySelectorAll('[data-label-delete-cancel]').forEach(button => {
+      button.onclick = () => {
+        pendingLabelDeleteId = null;
+        renderLabelManagerList(currentLabels);
+      };
+    });
+    container.querySelectorAll('[data-label-delete-confirm]').forEach(button => {
+      button.onclick = () => deleteLabel(button.dataset.labelDeleteConfirm);
+    });
+  }
+
+  async function openLabelManager() {
+    openModal('labels-modal');
+    renderLabelColorPresets();
+    resetLabelEditor({ focus: true });
+    const container = document.getElementById('label-manager-list');
+    container.innerHTML = `<div class="label-manager-loading"><i class="fa-solid fa-rotate fa-spin"></i>${esc(t('label.loading'))}</div>`;
+    try {
+      renderLabels(await rpc('labels.list'));
+      renderLabelManagerList(currentLabels);
+      resetLabelEditor({ focus: true });
+    } catch (error) {
+      container.innerHTML = `<div class="label-manager-empty">${esc(t('error'))} : ${esc(error.message)}</div>`;
+    }
+  }
+
+  async function saveLabel() {
+    const name = document.getElementById('label-name').value.trim();
+    const color = normalizeLabelColor(document.getElementById('label-color-hex').value);
+    if (!name) {
+      showLabelError(t('label.errorName'));
+      document.getElementById('label-name').focus();
+      return;
+    }
+    if (!color) {
+      showLabelError(t('label.errorColor'));
+      document.getElementById('label-color-hex').focus();
+      return;
+    }
+
+    const button = document.getElementById('btn-save-label');
+    button.disabled = true;
+    clearLabelError();
+    try {
+      const wasEditing = editingLabelId !== null;
+      const editedId = editingLabelId;
+      const labels = await rpc(wasEditing ? 'labels.update' : 'labels.add', wasEditing
+        ? { id: editingLabelId, name, color }
+        : { name, color });
+      renderLabels(labels);
+      pendingLabelDeleteId = null;
+      if (wasEditing && view.type === 'label' && String(view.labelId) === String(editedId)) {
+        document.getElementById('list-title').textContent = name;
+      }
+      renderLabelManagerList(currentLabels);
+      resetLabelEditor({ focus: true });
+      status(t(wasEditing ? 'label.updated' : 'label.created', { name }));
+      await refresh();
+    } catch (error) {
+      const duplicate = /unique|constraint.*labels\.name/i.test(error.message || '');
+      showLabelError(duplicate ? t('label.errorDuplicate') : `${t('error')} : ${error.message}`);
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function deleteLabel(labelId) {
+    const label = currentLabels.find(item => String(item.id) === String(labelId));
+    if (!label) return;
+    try {
+      const labels = await rpc('labels.remove', { id: label.id });
+      const deletedSelectedLabel = view.type === 'label' && String(view.labelId) === String(label.id);
+      if (deletedSelectedLabel) {
+        view = { type: 'unified' };
+        document.getElementById('list-title').textContent = t('unified.inbox');
+        document.querySelectorAll('.side-item').forEach(item => item.classList.remove('active'));
+        document.querySelector('[data-view="unified"]')?.classList.add('active');
+        clearReader();
+      }
+      pendingLabelDeleteId = null;
+      if (String(editingLabelId) === String(label.id)) resetLabelEditor();
+      renderLabels(labels);
+      renderLabelManagerList(currentLabels);
+      status(t('label.removed', { name: label.name }));
+      await refresh();
+    } catch (error) {
+      showLabelError(`${t('error')} : ${error.message}`);
+    }
+  }
+
+  // ---------- Règles de messagerie (filtres) ----------
+  const RULE_CONDITION_FIELDS = ['from', 'to', 'subject', 'body'];
+  const RULE_CONDITION_OPS = ['contains', 'notContains', 'equals', 'startsWith'];
+
+  function ruleConditionSummary(rule) {
+    const parts = (rule.conditions || []).map(condition =>
+      `${t('rules.field.' + condition.field)} ${t('rules.op.' + condition.op)} "${condition.value}"`);
+    return parts.join(rule.matchAll ? ` ${t('rules.and')} ` : ` ${t('rules.or')} `);
+  }
+
+  function ruleActionSummary(rule) {
+    const actions = rule.actions || {};
+    const parts = [];
+    if (actions.markRead) parts.push(t('rules.actionMarkRead'));
+    if (actions.flag) parts.push(t('rules.actionFlag'));
+    if (actions.isSpam === true) parts.push(t('rules.spamMark'));
+    if (actions.isSpam === false) parts.push(t('rules.spamUnmark'));
+    if (actions.labelId) {
+      const label = currentLabels.find(item => Number(item.id) === Number(actions.labelId));
+      if (label) parts.push(`${t('rules.actionLabel')} : ${label.name}`);
+    }
+    if (actions.moveTo) {
+      const target = actions.moveTo.type === 'role'
+        ? t('rules.folderRole.' + actions.moveTo.value)
+        : actions.moveTo.value;
+      parts.push(`${t('rules.actionMove')} : ${target}`);
+    }
+    return parts.join(', ') || t('rules.noActions');
+  }
+
+  function ruleFolderOptions(details) {
+    const options = [{ value: '', label: t('rules.moveNone') }];
+    const roles = ['inbox', 'sent', 'trash', 'junk'];
+    for (const role of roles) {
+      if (details?.folderMap?.[role]) options.push({ value: `role:${role}`, label: t('rules.folderRole.' + role) });
+    }
+    for (const folder of Array.isArray(details?.extraFolders) ? details.extraFolders : []) {
+      options.push({ value: `path:${folder}`, label: folder });
+    }
+    return options;
+  }
+
+  async function populateRuleAccountSelect() {
+    const select = document.getElementById('rule-account-select');
+    select.innerHTML = accounts.map(account =>
+      `<option value="${esc(account.id)}">${esc(account.displayName || account.email)}</option>`).join('');
+    if (!ruleAccountId || !accounts.some(account => account.id === ruleAccountId)) {
+      ruleAccountId = accounts[0]?.id || null;
+    }
+    select.value = ruleAccountId || '';
+  }
+
+  async function populateRuleActionDropdowns() {
+    const labelSelect = document.getElementById('rule-action-label');
+    labelSelect.innerHTML = `<option value="">${esc(t('rules.labelNone'))}</option>` +
+      currentLabels.map(label => `<option value="${label.id}">${esc(label.name)}</option>`).join('');
+
+    const moveSelect = document.getElementById('rule-action-move');
+    moveSelect.innerHTML = `<option value="">${esc(t('rules.moveNone'))}</option>`;
+    if (!ruleAccountId) return;
+    try {
+      const details = await rpc('accounts.getDetails', { id: ruleAccountId });
+      moveSelect.innerHTML = ruleFolderOptions(details)
+        .map(option => `<option value="${esc(option.value)}">${esc(option.label)}</option>`).join('');
+    } catch {
+      // Le dossier cible reste optionnel : une erreur réseau n'empêche pas
+      // de créer une règle sans action de déplacement.
+    }
+  }
+
+  function renderRuleConditions() {
+    const container = document.getElementById('rule-conditions-list');
+    container.innerHTML = '';
+    ruleConditions.forEach((condition, index) => {
+      const row = document.createElement('div');
+      row.className = 'rule-condition-row';
+      row.innerHTML = `
+        <select data-condition-field>${RULE_CONDITION_FIELDS.map(field =>
+          `<option value="${field}" ${condition.field === field ? 'selected' : ''}>${esc(t('rules.field.' + field))}</option>`).join('')}</select>
+        <select data-condition-op>${RULE_CONDITION_OPS.map(op =>
+          `<option value="${op}" ${condition.op === op ? 'selected' : ''}>${esc(t('rules.op.' + op))}</option>`).join('')}</select>
+        <input type="text" data-condition-value value="${esc(condition.value)}" placeholder="${esc(t('rules.conditionValuePlaceholder'))}">
+        <button class="iconbtn" type="button" data-remove-condition title="${esc(t('rules.removeCondition'))}"><i class="fa-solid fa-xmark"></i></button>`;
+      row.querySelector('[data-condition-field]').onchange = event => { condition.field = event.target.value; };
+      row.querySelector('[data-condition-op]').onchange = event => { condition.op = event.target.value; };
+      row.querySelector('[data-condition-value]').oninput = event => { condition.value = event.target.value; };
+      row.querySelector('[data-remove-condition]').onclick = () => {
+        ruleConditions.splice(index, 1);
+        if (!ruleConditions.length) ruleConditions.push({ field: 'from', op: 'contains', value: '' });
+        renderRuleConditions();
+      };
+      container.appendChild(row);
+    });
+  }
+
+  function addRuleCondition() {
+    ruleConditions.push({ field: 'subject', op: 'contains', value: '' });
+    renderRuleConditions();
+  }
+
+  function showRuleError(message) {
+    const box = document.getElementById('rule-form-error');
+    box.textContent = message;
+    box.classList.toggle('visible', Boolean(message));
+  }
+
+  async function resetRuleEditor({ focus = false } = {}) {
+    editingRuleId = null;
+    showRuleError('');
+    document.getElementById('rule-name').value = '';
+    document.getElementById('rule-match-all').value = '1';
+    document.getElementById('rule-action-markread').checked = false;
+    document.getElementById('rule-action-flag').checked = false;
+    document.getElementById('rule-action-spam').value = '';
+    document.getElementById('rule-action-label').value = '';
+    document.getElementById('rule-action-move').value = '';
+    document.getElementById('rule-stop-processing').checked = false;
+    ruleConditions = [{ field: 'from', op: 'contains', value: '' }];
+    renderRuleConditions();
+    document.getElementById('btn-save-rule').innerHTML =
+      `<i class="fa-solid fa-plus"></i><span>${esc(t('rules.create'))}</span>`;
+    document.getElementById('btn-cancel-rule-edit').classList.add('hidden');
+    document.getElementById('rule-editor-title').textContent = t('rules.new');
+    document.querySelectorAll('.rule-manager-row').forEach(row => row.classList.remove('editing'));
+    if (focus) setTimeout(() => document.getElementById('rule-name').focus(), 30);
+  }
+
+  function startRuleEdit(ruleId) {
+    const rule = currentRules.find(item => String(item.id) === String(ruleId));
+    if (!rule) return;
+    editingRuleId = rule.id;
+    pendingRuleDeleteId = null;
+    showRuleError('');
+    document.getElementById('rule-name').value = rule.name || '';
+    document.getElementById('rule-match-all').value = rule.matchAll ? '1' : '0';
+    const actions = rule.actions || {};
+    document.getElementById('rule-action-markread').checked = Boolean(actions.markRead);
+    document.getElementById('rule-action-flag').checked = Boolean(actions.flag);
+    document.getElementById('rule-action-spam').value = actions.isSpam === true ? '1' : actions.isSpam === false ? '0' : '';
+    document.getElementById('rule-action-label').value = actions.labelId ? String(actions.labelId) : '';
+    document.getElementById('rule-action-move').value = actions.moveTo
+      ? `${actions.moveTo.type}:${actions.moveTo.value}` : '';
+    document.getElementById('rule-stop-processing').checked = Boolean(rule.stopProcessing);
+    ruleConditions = (rule.conditions || []).map(condition => ({ ...condition }));
+    if (!ruleConditions.length) ruleConditions.push({ field: 'from', op: 'contains', value: '' });
+    renderRuleConditions();
+    document.getElementById('btn-save-rule').innerHTML =
+      `<i class="fa-solid fa-floppy-disk"></i><span>${esc(t('rules.update'))}</span>`;
+    document.getElementById('btn-cancel-rule-edit').classList.remove('hidden');
+    document.getElementById('rule-editor-title').textContent = t('rules.edit');
+    renderRuleManagerList();
+    setTimeout(() => document.getElementById('rule-name').focus(), 20);
+  }
+
+  function renderRuleManagerList() {
+    const container = document.getElementById('rule-list');
+    container.innerHTML = '';
+    if (!currentRules.length) {
+      container.innerHTML = `<div class="label-manager-empty">
+        <i class="fa-solid fa-filter"></i>
+        <span>${esc(t('rules.noRules'))}</span>
+      </div>`;
+      return;
+    }
+
+    currentRules.forEach((rule, index) => {
+      const row = document.createElement('div');
+      row.className = 'rule-manager-row';
+      if (String(editingRuleId) === String(rule.id)) row.classList.add('editing');
+      const isConfirming = String(pendingRuleDeleteId) === String(rule.id);
+      row.innerHTML = `
+        <label class="rule-enabled-toggle">
+          <input type="checkbox" data-rule-toggle="${rule.id}" ${rule.enabled ? 'checked' : ''}>
+        </label>
+        <div class="rule-manager-info">
+          <strong>${esc(rule.name || ruleConditionSummary(rule))}</strong>
+          <span>${esc(ruleConditionSummary(rule))}</span>
+          <span class="rule-manager-actions-summary">${esc(ruleActionSummary(rule))}</span>
+        </div>
+        <div class="rule-manager-reorder">
+          <button class="iconbtn" type="button" data-rule-up="${rule.id}" ${index === 0 ? 'disabled' : ''} title="${esc(t('rules.moveUp'))}"><i class="fa-solid fa-chevron-up"></i></button>
+          <button class="iconbtn" type="button" data-rule-down="${rule.id}" ${index === currentRules.length - 1 ? 'disabled' : ''} title="${esc(t('rules.moveDown'))}"><i class="fa-solid fa-chevron-down"></i></button>
+        </div>
+        <div class="label-manager-actions ${isConfirming ? 'confirming' : ''}">
+          ${isConfirming ? `
+            <span class="label-delete-question">${esc(t('rules.deleteConfirm'))}</span>
+            <button class="btn danger compact" type="button" data-rule-delete-confirm="${rule.id}">
+              <i class="fa-solid fa-trash"></i>${esc(t('label.deleteYes'))}
+            </button>
+            <button class="btn compact" type="button" data-rule-delete-cancel="${rule.id}">${esc(t('cancel'))}</button>
+          ` : `
+            <button class="iconbtn" type="button" data-rule-edit="${rule.id}" title="${esc(t('rules.edit'))}">
+              <i class="fa-solid fa-pen"></i>
+            </button>
+            <button class="iconbtn label-delete-btn" type="button" data-rule-delete="${rule.id}" title="${esc(t('rules.delete'))}">
+              <i class="fa-solid fa-trash"></i>
+            </button>
+          `}
+        </div>`;
+      container.appendChild(row);
+    });
+
+    container.querySelectorAll('[data-rule-edit]').forEach(button => {
+      button.onclick = () => startRuleEdit(button.dataset.ruleEdit);
+    });
+    container.querySelectorAll('[data-rule-delete]').forEach(button => {
+      button.onclick = () => {
+        pendingRuleDeleteId = button.dataset.ruleDelete;
+        renderRuleManagerList();
+      };
+    });
+    container.querySelectorAll('[data-rule-delete-cancel]').forEach(button => {
+      button.onclick = () => {
+        pendingRuleDeleteId = null;
+        renderRuleManagerList();
+      };
+    });
+    container.querySelectorAll('[data-rule-delete-confirm]').forEach(button => {
+      button.onclick = () => deleteRule(button.dataset.ruleDeleteConfirm);
+    });
+    container.querySelectorAll('[data-rule-toggle]').forEach(input => {
+      input.onchange = () => toggleRuleEnabled(input.dataset.ruleToggle, input.checked);
+    });
+    container.querySelectorAll('[data-rule-up]').forEach(button => {
+      button.onclick = () => reorderRule(button.dataset.ruleUp, -1);
+    });
+    container.querySelectorAll('[data-rule-down]').forEach(button => {
+      button.onclick = () => reorderRule(button.dataset.ruleDown, 1);
+    });
+  }
+
+  async function loadRulesForAccount() {
+    const container = document.getElementById('rule-list');
+    container.innerHTML = `<div class="label-manager-loading"><i class="fa-solid fa-rotate fa-spin"></i>${esc(t('rules.loading'))}</div>`;
+    try {
+      currentRules = await rpc('rules.list', { accountId: ruleAccountId });
+      renderRuleManagerList();
+    } catch (error) {
+      container.innerHTML = `<div class="label-manager-empty">${esc(t('error'))} : ${esc(error.message)}</div>`;
+    }
+  }
+
+  async function openMailRulesModal(prefill = null) {
+    openModal('mail-rules-modal');
+    if (prefill?.accountId) ruleAccountId = prefill.accountId;
+    await populateRuleAccountSelect();
+    await populateRuleActionDropdowns();
+    await resetRuleEditor();
+    if (prefill?.condition) {
+      ruleConditions = [{ ...prefill.condition }];
+      renderRuleConditions();
+      document.getElementById('rule-editor-title').textContent = t('rules.new');
+    }
+    await loadRulesForAccount();
+  }
+
+  function readRuleActionsFromForm() {
+    const actions = {};
+    if (document.getElementById('rule-action-markread').checked) actions.markRead = true;
+    if (document.getElementById('rule-action-flag').checked) actions.flag = true;
+    const spamValue = document.getElementById('rule-action-spam').value;
+    if (spamValue === '1') actions.isSpam = true;
+    else if (spamValue === '0') actions.isSpam = false;
+    const labelValue = document.getElementById('rule-action-label').value;
+    if (labelValue) actions.labelId = Number(labelValue);
+    const moveValue = document.getElementById('rule-action-move').value;
+    if (moveValue) {
+      const separatorIndex = moveValue.indexOf(':');
+      actions.moveTo = { type: moveValue.slice(0, separatorIndex), value: moveValue.slice(separatorIndex + 1) };
+    }
+    return actions;
+  }
+
+  async function saveRuleFromForm() {
+    const conditions = ruleConditions
+      .map(condition => ({ ...condition, value: condition.value.trim() }))
+      .filter(condition => condition.value);
+    if (!conditions.length) {
+      showRuleError(t('rules.errorCondition'));
+      return;
+    }
+    const actions = readRuleActionsFromForm();
+    if (!Object.keys(actions).length) {
+      showRuleError(t('rules.errorAction'));
+      return;
+    }
+
+    const button = document.getElementById('btn-save-rule');
+    button.disabled = true;
+    showRuleError('');
+    try {
+      const payload = {
+        id: editingRuleId || undefined,
+        accountId: ruleAccountId,
+        name: document.getElementById('rule-name').value.trim(),
+        matchAll: document.getElementById('rule-match-all').value === '1',
+        stopProcessing: document.getElementById('rule-stop-processing').checked,
+        conditions,
+        actions,
+      };
+      const wasEditing = Boolean(editingRuleId);
+      await rpc('rules.save', payload);
+      await loadRulesForAccount();
+      await resetRuleEditor({ focus: true });
+      status(t(wasEditing ? 'rules.updated' : 'rules.created'), 'success');
+    } catch (error) {
+      showRuleError(`${t('error')} : ${error.message}`);
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function deleteRule(ruleId) {
+    try {
+      await rpc('rules.remove', { id: ruleId });
+      pendingRuleDeleteId = null;
+      if (String(editingRuleId) === String(ruleId)) await resetRuleEditor();
+      await loadRulesForAccount();
+      status(t('rules.removed'), 'success');
+    } catch (error) {
+      status(`${t('error')} : ${error.message}`, 'error');
+    }
+  }
+
+  async function toggleRuleEnabled(ruleId, enabled) {
+    const rule = currentRules.find(item => String(item.id) === String(ruleId));
+    if (!rule) return;
+    try {
+      await rpc('rules.save', { ...rule, accountId: ruleAccountId, enabled });
+      await loadRulesForAccount();
+    } catch (error) {
+      status(`${t('error')} : ${error.message}`, 'error');
+      await loadRulesForAccount();
+    }
+  }
+
+  async function reorderRule(ruleId, direction) {
+    const index = currentRules.findIndex(item => String(item.id) === String(ruleId));
+    const target = index + direction;
+    if (index < 0 || target < 0 || target >= currentRules.length) return;
+    const orderedIds = currentRules.map(rule => rule.id);
+    [orderedIds[index], orderedIds[target]] = [orderedIds[target], orderedIds[index]];
+    try {
+      currentRules = await rpc('rules.reorder', { accountId: ruleAccountId, orderedIds });
+      renderRuleManagerList();
+    } catch (error) {
+      status(`${t('error')} : ${error.message}`, 'error');
+    }
+  }
+
+  async function applyRulesToExistingMessages() {
+    const button = document.getElementById('btn-apply-rules-existing');
+    button.disabled = true;
+    try {
+      const result = await rpc('rules.applyToExisting', { accountId: ruleAccountId });
+      status(t('rules.applyDone', { count: result.processed }), 'success');
+      await refresh();
+    } catch (error) {
+      status(`${t('error')} : ${error.message}`, 'error');
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  function openRuleEditorFromMessage() {
+    const message = Viewer.current;
+    if (!message) return;
+    const senderEmail = String(message.headers?.from || '').match(/<([^>]+)>/)?.[1]
+      || String(message.headers?.from || '').trim();
+    openMailRulesModal({
+      accountId: message.meta.account_id,
+      condition: { field: 'from', op: 'contains', value: senderEmail },
+    });
+  }
+
+  async function renderLabelMenu() {
+    const menu = document.getElementById('label-menu');
+    const message = Viewer.current;
+    if (!message) return;
+    const labels = await rpc('labels.ofMessage', { messageId: message.meta.id });
+    menu.innerHTML = '';
+    if (!labels.length) {
+      menu.innerHTML = `<div class="empty-hint">${esc(t('label.emptyHint'))}</div>`;
+    }
+    for (const label of labels) {
+      const button = document.createElement('button');
+      button.className = 'side-item';
+      button.innerHTML = `<span class="account-dot" style="background:${safeColor(label.color)}"></span>
+        <span style="overflow:hidden;text-overflow:ellipsis">${esc(label.name)}</span>
+        ${label.applied ? '<i class="fa-solid fa-check"></i>' : ''}`;
+      button.onclick = async event => {
+        event.stopPropagation();
+        button.disabled = true;
+        try {
+          await rpc(label.applied ? 'labels.untag' : 'labels.tag', {
+            messageId: message.meta.id,
+            labelId: label.id,
+          });
+          // Une sélection d'étiquette est une action ponctuelle : le menu se
+          // referme et la liste conserve le message actif ainsi que sa position.
+          menu.classList.add('hidden');
+          await refreshVisibleList({ preserveListState: true });
+        } catch (error) {
+          status(`${t('error')} : ${error.message}`, 'error');
+          button.disabled = false;
+        }
+      };
+      menu.appendChild(button);
+    }
+  }
+
+  async function toggleLabelMenu(event) {
+    event.stopPropagation();
+    closeQuickLabelMenu();
+    const menu = document.getElementById('label-menu');
+    if (menu.classList.contains('hidden')) {
+      await renderLabelMenu();
+      menu.classList.remove('hidden');
+    } else {
+      menu.classList.add('hidden');
+    }
+  }
+
+  async function refreshSpamStats() {
+    const statistics = await rpc('spam.stats');
+    document.getElementById('spam-stats').textContent = t('spam.stats', {
+      ham: statistics.hamMessages,
+      spam: statistics.spamMessages,
+    });
+  }
+
+  // ---------- Statistiques ----------
+  async function openStatistics() {
+    openModal('stats-modal');
+    await loadStatistics();
+  }
+
+  async function loadStatistics() {
+    const body = document.getElementById('stats-body');
+    const token = ++statisticsRequestToken;
+    body.innerHTML = `<div class="stats-loading"><i class="fa-solid fa-rotate fa-spin"></i>${esc(t('stats.loading'))}</div>`;
+    try {
+      const statistics = await rpc('stats.get', {
+        period: statisticsState.period,
+        accountId: statisticsState.accountId || undefined,
+      });
+      if (token !== statisticsRequestToken) return;
+      statisticsData = statistics;
+      renderStatistics(statistics);
+    } catch (error) {
+      if (token !== statisticsRequestToken) return;
+      body.innerHTML = `<div class="stats-empty">${esc(t('error'))} : ${esc(error.message)}</div>`;
+    }
+  }
+
+  function renderStatistics(data) {
+    const summary = data.summary || {};
+    const globalSummary = data.globalSummary || summary;
+    const previous = data.previous || null;
+    const body = document.getElementById('stats-body');
+    const accountOptions = accounts.map(account => `
+      <option value="${esc(account.id)}" ${statisticsState.accountId === account.id ? 'selected' : ''}>
+        ${esc(account.displayName || account.email)}
+      </option>`).join('');
+
+    const cards = [
+      {
+        icon: 'fa-envelope', label: 'stats.total', value: numberFormat(summary.total),
+        detail: t('stats.averagePerDay', { count: formatDecimal(summary.averagePerActiveDay, 1) }),
+        delta: statsDelta(summary.total, previous?.total),
+      },
+      {
+        icon: 'fa-inbox', label: 'stats.received', value: numberFormat(summary.received),
+        detail: t('stats.readRateValue', { rate: formatPercent(summary.readRate) }),
+        delta: statsDelta(summary.received, previous?.received),
+      },
+      {
+        icon: 'fa-paper-plane', label: 'stats.sent', value: numberFormat(summary.sent),
+        detail: t('stats.responseRateValue', { rate: formatPercent(summary.responseRate) }),
+        delta: statsDelta(summary.sent, previous?.sent),
+      },
+      {
+        icon: 'fa-comments', label: 'stats.conversations', value: numberFormat(summary.conversations),
+        detail: t('stats.messagesPerConversation', {
+          count: formatDecimal((summary.total || 0) / Math.max(1, summary.conversations || 0), 1),
+        }),
+      },
+      {
+        icon: 'fa-envelope-open-text', label: 'stats.unread', value: numberFormat(summary.unread),
+        detail: t('stats.ofReceived', {
+          rate: formatPercent((summary.received || 0) ? (summary.unread || 0) * 100 / summary.received : 0),
+        }),
+      },
+      {
+        icon: 'fa-paperclip', label: 'stats.attachments', value: numberFormat(summary.attachments),
+        detail: t('stats.ofMessages', { rate: formatPercent(summary.attachmentRate) }),
+      },
+      {
+        icon: 'fa-ban', label: 'stats.spam', value: numberFormat(summary.spam),
+        detail: t('stats.ofReceived', { rate: formatPercent(summary.spamRate) }),
+      },
+      {
+        icon: 'fa-database', label: 'stats.selectionSize', value: fmtSize(summary.totalSize),
+        detail: t('stats.periodValue', { period: formatPeriod(summary.oldestDate, summary.newestDate) }),
+        delta: statsDelta(summary.totalSize, previous?.totalSize),
+      },
+    ];
+
+    body.innerHTML = `
+      <div class="stats-toolbar">
+        <div class="stats-filter-group">
+          <label>${esc(t('stats.periodFilter'))}
+            <select id="stats-period-select">
+              ${['7d', '30d', '90d', '365d', 'all'].map(value => `
+                <option value="${value}" ${statisticsState.period === value ? 'selected' : ''}>${esc(t(`stats.period.${value}`))}</option>
+              `).join('')}
+            </select>
+          </label>
+          <label>${esc(t('stats.accountFilter'))}
+            <select id="stats-account-select">
+              <option value="">${esc(t('stats.allAccounts'))}</option>
+              ${accountOptions}
+            </select>
+          </label>
+        </div>
+        <div class="stats-toolbar-actions">
+          <button class="btn" id="btn-stats-refresh" type="button"><i class="fa-solid fa-rotate"></i>${esc(t('stats.refresh'))}</button>
+        </div>
+      </div>
+
+      <nav class="stats-tabs" aria-label="${esc(t('stats.title'))}">
+        ${['overview', 'activity', 'contacts', 'storage'].map(tab => `
+          <button type="button" data-stats-tab="${tab}" class="${statisticsState.tab === tab ? 'active' : ''}">
+            <i class="fa-solid ${statsTabIcon(tab)}"></i>${esc(t(`stats.tab.${tab}`))}
+          </button>`).join('')}
+      </nav>
+
+      <div class="stats-panel ${statisticsState.tab === 'overview' ? 'active' : ''}" data-stats-panel="overview">
+        <div class="stats-kpi-grid">
+          ${cards.map(renderStatisticsCard).join('')}
+        </div>
+        <section class="stats-section stats-section-wide">
+          <div class="stats-section-heading">
+            <div><h3>${esc(t('stats.timeline'))}</h3><p>${esc(t('stats.timelineHint'))}</p></div>
+            <div class="stats-legend"><span class="received"></span>${esc(t('stats.received'))}<span class="sent"></span>${esc(t('stats.sent'))}</div>
+          </div>
+          ${buildTimelineChart(data.timeline || [], data.period?.grain || 'day')}
+        </section>
+        <div class="stats-two-columns">
+          ${buildFolderDistribution(data.byFolder || [])}
+          ${buildAccountStatistics(data.byAccount || [])}
+        </div>
+      </div>
+
+      <div class="stats-panel ${statisticsState.tab === 'activity' ? 'active' : ''}" data-stats-panel="activity">
+        <div class="stats-two-columns">
+          ${buildWeekdayChart(data.byWeekday || [])}
+          ${buildUnreadAge(data.unreadAge || [])}
+        </div>
+        ${buildHourlyHeatmap(data.byHour || [])}
+      </div>
+
+      <div class="stats-panel ${statisticsState.tab === 'contacts' ? 'active' : ''}" data-stats-panel="contacts">
+        <div class="stats-two-columns">
+          ${buildContactTable('senders', data.topSenders || [])}
+          ${buildContactTable('recipients', data.topRecipients || [])}
+        </div>
+        <div class="stats-two-columns">
+          ${buildRankBars('domains', data.topDomains || [], row => row.domain, row => row.total)}
+          ${buildLabelStatistics(data.labels || [])}
+        </div>
+      </div>
+
+      <div class="stats-panel ${statisticsState.tab === 'storage' ? 'active' : ''}" data-stats-panel="storage">
+        <div class="stats-storage-summary">
+          <div><i class="fa-solid fa-database"></i><b>${fmtSize(globalSummary.totalSize)}</b><span>${esc(t('stats.localSize'))}</span></div>
+          <div><i class="fa-solid fa-paperclip"></i><b>${numberFormat(summary.attachments)}</b><span>${esc(t('stats.attachments'))}</span></div>
+          <div><i class="fa-solid fa-trash-can"></i><b>${numberFormat(globalSummary.trash)}</b><span>${esc(t('trash.folder'))}</span></div>
+          <div><i class="fa-solid fa-star"></i><b>${numberFormat(globalSummary.flagged)}</b><span>${esc(t('stats.flagged'))}</span></div>
+        </div>
+        ${buildLargestMessages(data.largestMessages || [])}
+      </div>
+
+      <p class="stats-note"><i class="fa-solid fa-circle-info"></i>${esc(t('stats.localNote'))}</p>`;
+
+    wireStatisticsDashboard();
+  }
+
+  function renderStatisticsCard(card) {
+    return `<article class="stat-card-v2">
+      <div class="stat-card-icon"><i class="fa-solid ${card.icon}"></i></div>
+      <div class="stat-card-main">
+        <span class="stat-label">${esc(t(card.label))}</span>
+        <strong class="stat-value">${esc(card.value)}</strong>
+        <span class="stat-detail">${esc(card.detail || '')}</span>
+      </div>
+      ${card.delta ? `<span class="stat-delta ${card.delta.className}"><i class="fa-solid ${card.delta.icon}"></i>${esc(card.delta.text)}</span>` : ''}
+    </article>`;
+  }
+
+  function statsDelta(current, previous) {
+    if (previous == null || !Number.isFinite(Number(previous))) return null;
+    const now = Number(current) || 0;
+    const before = Number(previous) || 0;
+    if (before === 0) {
+      if (now === 0) return { className: 'neutral', icon: 'fa-minus', text: '0 %' };
+      return { className: 'up', icon: 'fa-arrow-up', text: t('stats.newActivity') };
+    }
+    const change = ((now - before) / Math.abs(before)) * 100;
+    if (Math.abs(change) < 0.05) return { className: 'neutral', icon: 'fa-minus', text: '0 %' };
+    return {
+      className: change > 0 ? 'up' : 'down',
+      icon: change > 0 ? 'fa-arrow-up' : 'fa-arrow-down',
+      text: `${Math.abs(change).toLocaleString(I18N.locale, { maximumFractionDigits: 1 })} %`,
+    };
+  }
+
+  function statsTabIcon(tab) {
+    return {
+      overview: 'fa-chart-pie',
+      activity: 'fa-wave-square',
+      contacts: 'fa-address-book',
+      storage: 'fa-hard-drive',
+    }[tab] || 'fa-chart-column';
+  }
+
+  function wireStatisticsDashboard() {
+    document.getElementById('stats-period-select').onchange = event => {
+      statisticsState.period = event.target.value;
+      loadStatistics();
+    };
+    document.getElementById('stats-account-select').onchange = event => {
+      statisticsState.accountId = event.target.value;
+      loadStatistics();
+    };
+    document.getElementById('btn-stats-refresh').onclick = loadStatistics;
+    document.querySelectorAll('[data-stats-tab]').forEach(button => {
+      button.onclick = () => activateStatisticsTab(button.dataset.statsTab);
+    });
+  }
+
+  function activateStatisticsTab(tab) {
+    statisticsState.tab = tab;
+    document.querySelectorAll('[data-stats-tab]').forEach(button => {
+      button.classList.toggle('active', button.dataset.statsTab === tab);
+    });
+    document.querySelectorAll('[data-stats-panel]').forEach(panel => {
+      panel.classList.toggle('active', panel.dataset.statsPanel === tab);
+    });
+  }
+
+  function buildTimelineChart(rows, grain) {
+    if (!rows.length) return `<div class="stats-empty-block">${esc(t('stats.noData'))}</div>`;
+    const width = 960;
+    const height = 250;
+    const left = 44;
+    const right = 18;
+    const top = 16;
+    const bottom = 38;
+    const chartWidth = width - left - right;
+    const chartHeight = height - top - bottom;
+    const maximum = Math.max(1, ...rows.flatMap(row => [Number(row.received) || 0, Number(row.sent) || 0]));
+    const xAt = index => rows.length === 1 ? left + chartWidth / 2 : left + (index * chartWidth / (rows.length - 1));
+    const yAt = value => top + chartHeight - ((Number(value) || 0) / maximum * chartHeight);
+    const receivedPoints = rows.map((row, index) => `${xAt(index).toFixed(1)},${yAt(row.received).toFixed(1)}`).join(' ');
+    const sentPoints = rows.map((row, index) => `${xAt(index).toFixed(1)},${yAt(row.sent).toFixed(1)}`).join(' ');
+    const labelIndexes = [...new Set([0, Math.floor((rows.length - 1) / 4), Math.floor((rows.length - 1) / 2), Math.floor((rows.length - 1) * 3 / 4), rows.length - 1])];
+    const grid = Array.from({ length: 5 }, (_, index) => {
+      const ratio = index / 4;
+      const y = top + ratio * chartHeight;
+      const value = Math.round(maximum * (1 - ratio));
+      return `<line x1="${left}" y1="${y}" x2="${width - right}" y2="${y}" class="stats-grid-line"/>
+        <text x="${left - 8}" y="${y + 4}" text-anchor="end" class="stats-axis-text">${compactNumber(value)}</text>`;
+    }).join('');
+    const xLabels = labelIndexes.map(index => `
+      <text x="${xAt(index)}" y="${height - 12}" text-anchor="middle" class="stats-axis-text">${esc(formatStatsBucket(rows[index].bucket, grain))}</text>
+    `).join('');
+    const points = rows.length <= 60 ? rows.map((row, index) => `
+      <circle cx="${xAt(index)}" cy="${yAt(row.received)}" r="3" class="stats-point received"><title>${esc(formatStatsBucket(row.bucket, grain))} · ${esc(t('stats.received'))} : ${row.received}</title></circle>
+      <circle cx="${xAt(index)}" cy="${yAt(row.sent)}" r="3" class="stats-point sent"><title>${esc(formatStatsBucket(row.bucket, grain))} · ${esc(t('stats.sent'))} : ${row.sent}</title></circle>
+    `).join('') : '';
+    return `<div class="stats-line-chart"><svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${esc(t('stats.timeline'))}">
+      ${grid}${xLabels}
+      <polyline points="${receivedPoints}" class="stats-line received"/>
+      <polyline points="${sentPoints}" class="stats-line sent"/>
+      ${points}
+    </svg></div>`;
+  }
+
+  function formatStatsBucket(bucket, grain) {
+    if (!bucket) return '';
+    if (grain === 'month') {
+      const [year, month] = bucket.split('-').map(Number);
+      return new Date(year, month - 1, 1).toLocaleDateString(I18N.locale, { month: 'short', year: '2-digit' });
+    }
+    if (grain === 'week') {
+      const [year, week] = bucket.split('-W');
+      return t('stats.weekLabel', { week: Number(week), year });
+    }
+    const [year, month, day] = bucket.split('-').map(Number);
+    return new Date(year, month - 1, day).toLocaleDateString(I18N.locale, { day: 'numeric', month: 'short' });
+  }
+
+  function buildFolderDistribution(rows) {
+    const order = ['inbox', 'sent', 'junk', 'trash', 'other'];
+    const totals = Object.fromEntries(order.map(role => [role, 0]));
+    for (const row of rows) totals[order.includes(row.role) ? row.role : 'other'] += Number(row.total) || 0;
+    const total = Object.values(totals).reduce((sum, value) => sum + value, 0);
+    const colors = {
+      inbox: 'var(--accent)', sent: '#4f8bd6', junk: 'var(--danger)',
+      trash: 'var(--fg-faint)', other: 'var(--ok)',
+    };
+    let cursor = 0;
+    const segments = order.filter(role => totals[role] > 0).map(role => {
+      const start = cursor;
+      cursor += totals[role] * 100 / Math.max(1, total);
+      return `${colors[role]} ${start.toFixed(2)}% ${cursor.toFixed(2)}%`;
+    });
+    const gradient = segments.length ? `conic-gradient(${segments.join(',')})` : 'var(--bg-hover)';
+    return `<section class="stats-section stats-card-section">
+      <div class="stats-section-heading"><div><h3>${esc(t('stats.byFolder'))}</h3><p>${esc(t('stats.byFolderHint'))}</p></div></div>
+      <div class="stats-donut-layout">
+        <div class="stats-donut" style="background:${gradient}"><div><b>${numberFormat(total)}</b><span>${esc(t('stats.messages'))}</span></div></div>
+        <div class="stats-donut-legend">
+          ${order.map(role => `<div><span style="background:${colors[role]}"></span><b>${esc(t(`stats.folder.${role}`))}</b><em>${numberFormat(totals[role])}</em></div>`).join('')}
+        </div>
+      </div>
+    </section>`;
+  }
+
+  function buildAccountStatistics(rows) {
+    const tableRows = rows.map(account => `
+      <tr>
+        <td><span class="account-dot" style="background:${safeColor(account.color)}"></span><span>${esc(account.displayName)}</span></td>
+        <td>${numberFormat(account.received)}</td><td>${numberFormat(account.sent)}</td>
+        <td>${numberFormat(account.unread)}</td><td>${numberFormat(account.spam)}</td><td>${fmtSize(account.totalSize)}</td>
+      </tr>`).join('') || `<tr><td colspan="6">${esc(t('stats.noData'))}</td></tr>`;
+    return `<section class="stats-section stats-card-section">
+      <div class="stats-section-heading"><div><h3>${esc(t('stats.byAccount'))}</h3><p>${esc(t('stats.byAccountHint'))}</p></div></div>
+      <div class="table-scroll"><table class="stats-table compact">
+        <thead><tr><th>${esc(t('accounts'))}</th><th>${esc(t('stats.received'))}</th><th>${esc(t('stats.sent'))}</th><th>${esc(t('stats.unread'))}</th><th>${esc(t('stats.spam'))}</th><th>${esc(t('stats.size'))}</th></tr></thead>
+        <tbody>${tableRows}</tbody>
+      </table></div>
+    </section>`;
+  }
+
+  function buildWeekdayChart(rows) {
+    const indexed = new Map(rows.map(row => [Number(row.weekday), row]));
+    const days = [1, 2, 3, 4, 5, 6, 0];
+    const values = days.map(day => indexed.get(day) || { received: 0, sent: 0 });
+    const maximum = Math.max(1, ...values.flatMap(row => [Number(row.received) || 0, Number(row.sent) || 0]));
+    return `<section class="stats-section stats-card-section">
+      <div class="stats-section-heading"><div><h3>${esc(t('stats.byWeekday'))}</h3><p>${esc(t('stats.byWeekdayHint'))}</p></div></div>
+      <div class="stats-weekday-chart">
+        ${days.map((day, index) => {
+          const row = values[index];
+          const receivedHeight = row.received ? Math.max(4, row.received * 100 / maximum) : 0;
+          const sentHeight = row.sent ? Math.max(4, row.sent * 100 / maximum) : 0;
+          return `<div class="stats-weekday-column">
+            <div class="stats-weekday-bars">
+              <span class="received" style="height:${receivedHeight}%" title="${esc(t('stats.received'))} : ${row.received}"></span>
+              <span class="sent" style="height:${sentHeight}%" title="${esc(t('stats.sent'))} : ${row.sent}"></span>
+            </div>
+            <b>${esc(t(`stats.weekday.${day}`))}</b><small>${numberFormat((row.received || 0) + (row.sent || 0))}</small>
+          </div>`;
+        }).join('')}
+      </div>
+    </section>`;
+  }
+
+  function buildHourlyHeatmap(rows) {
+    const indexed = new Map(rows.map(row => [Number(row.hour), Number(row.total) || 0]));
+    const maximum = Math.max(1, ...indexed.values());
+    return `<section class="stats-section stats-card-section stats-section-wide">
+      <div class="stats-section-heading"><div><h3>${esc(t('stats.byHour'))}</h3><p>${esc(t('stats.byHourHint'))}</p></div></div>
+      <div class="stats-hour-grid">
+        ${Array.from({ length: 24 }, (_, hour) => {
+          const value = indexed.get(hour) || 0;
+          const intensity = Math.round(value * 100 / maximum);
+          return `<div class="stats-hour-cell" style="--intensity:${intensity}%" title="${String(hour).padStart(2, '0')}:00 · ${value} ${esc(t('stats.messages').toLocaleLowerCase())}">
+            <b>${String(hour).padStart(2, '0')}</b><span>${numberFormat(value)}</span>
+          </div>`;
+        }).join('')}
+      </div>
+    </section>`;
+  }
+
+  function buildUnreadAge(rows) {
+    const indexed = new Map(rows.map(row => [row.age, Number(row.total) || 0]));
+    const ages = ['day', 'week', 'month', 'quarter', 'older'];
+    const maximum = Math.max(1, ...ages.map(age => indexed.get(age) || 0));
+    return `<section class="stats-section stats-card-section">
+      <div class="stats-section-heading"><div><h3>${esc(t('stats.unreadAge'))}</h3><p>${esc(t('stats.unreadAgeHint'))}</p></div></div>
+      <div class="stats-horizontal-bars">
+        ${ages.map(age => {
+          const value = indexed.get(age) || 0;
+          return `<div><span>${esc(t(`stats.age.${age}`))}</span><div><i style="width:${value * 100 / maximum}%"></i></div><b>${numberFormat(value)}</b></div>`;
+        }).join('')}
+      </div>
+    </section>`;
+  }
+
+  function buildContactTable(type, rows) {
+    const sender = type === 'senders';
+    const tableRows = rows.map(row => `
+      <tr><td><b>${esc(sender ? row.sender : row.recipient)}</b>${sender && row.address && row.address !== row.sender ? `<small>${esc(row.address)}</small>` : ''}</td>
+      <td>${numberFormat(row.total)}</td><td>${fmtSize(row.totalSize)}</td><td>${fmtDateTime(row.lastDate)}</td></tr>
+    `).join('') || `<tr><td colspan="4">${esc(t('stats.noData'))}</td></tr>`;
+    return `<section class="stats-section stats-card-section">
+      <div class="stats-section-heading"><div><h3>${esc(t(`stats.top.${type}`))}</h3><p>${esc(t(`stats.top.${type}Hint`))}</p></div></div>
+      <div class="table-scroll"><table class="stats-table compact contacts">
+        <thead><tr><th>${esc(t(sender ? 'stats.sender' : 'stats.recipient'))}</th><th>${esc(t('stats.messages'))}</th><th>${esc(t('stats.size'))}</th><th>${esc(t('stats.lastActivity'))}</th></tr></thead>
+        <tbody>${tableRows}</tbody>
+      </table></div>
+    </section>`;
+  }
+
+  function buildRankBars(type, rows, labelGetter, valueGetter) {
+    const maximum = Math.max(1, ...rows.map(valueGetter));
+    return `<section class="stats-section stats-card-section">
+      <div class="stats-section-heading"><div><h3>${esc(t(`stats.${type}`))}</h3><p>${esc(t(`stats.${type}Hint`))}</p></div></div>
+      <div class="stats-ranked-bars">
+        ${rows.map((row, index) => {
+          const value = Number(valueGetter(row)) || 0;
+          return `<div><span class="rank">${index + 1}</span><span class="rank-label" title="${esc(labelGetter(row))}">${esc(labelGetter(row))}</span><div><i style="width:${value * 100 / maximum}%"></i></div><b>${numberFormat(value)}</b></div>`;
+        }).join('') || `<div class="stats-empty-block">${esc(t('stats.noData'))}</div>`}
+      </div>
+    </section>`;
+  }
+
+  function buildLabelStatistics(rows) {
+    const maximum = Math.max(1, ...rows.map(row => Number(row.total) || 0));
+    return `<section class="stats-section stats-card-section">
+      <div class="stats-section-heading"><div><h3>${esc(t('stats.labels'))}</h3><p>${esc(t('stats.labelsHint'))}</p></div></div>
+      <div class="stats-ranked-bars label-bars">
+        ${rows.map((row, index) => `<div><span class="rank label-dot" style="background:${safeColor(row.color)}"></span><span class="rank-label">${esc(row.name)}</span><div><i style="width:${Number(row.total) * 100 / maximum}%;background:${safeColor(row.color)}"></i></div><b>${numberFormat(row.total)}</b></div>`).join('') || `<div class="stats-empty-block">${esc(t('stats.noData'))}</div>`}
+      </div>
+    </section>`;
+  }
+
+  function buildLargestMessages(rows) {
+    const tableRows = rows.map(row => `
+      <tr>
+        <td><span class="account-dot" style="background:${safeColor(row.color)}"></span>${esc(row.displayName)}</td>
+        <td><b title="${esc(row.subject || t('compose.noSubject'))}">${esc(row.subject || t('compose.noSubject'))}</b><small>${esc(row.from_name || row.from_addr || row.to_addr || '')}</small></td>
+        <td>${esc(t(`stats.folder.${['inbox', 'sent', 'junk', 'trash'].includes(row.folder_role) ? row.folder_role : 'other'}`))}</td>
+        <td>${fmtDateTime(row.date)}</td><td><b>${fmtSize(row.size)}</b></td>
+      </tr>`).join('') || `<tr><td colspan="5">${esc(t('stats.noData'))}</td></tr>`;
+    return `<section class="stats-section stats-card-section stats-section-wide">
+      <div class="stats-section-heading"><div><h3>${esc(t('stats.largestMessages'))}</h3><p>${esc(t('stats.largestMessagesHint'))}</p></div></div>
+      <div class="table-scroll"><table class="stats-table largest">
+        <thead><tr><th>${esc(t('accounts'))}</th><th>${esc(t('compose.subject'))}</th><th>${esc(t('stats.folder'))}</th><th>${esc(t('stats.date'))}</th><th>${esc(t('stats.size'))}</th></tr></thead>
+        <tbody>${tableRows}</tbody>
+      </table></div>
+    </section>`;
+  }
+
+  async function exportStatisticsCsv() {
+    if (!statisticsData) {
+      status(t('stats.noData'), 'info');
+      return;
+    }
+    const button = document.getElementById('btn-stats-export');
+    const filename = `FaroMail-statistiques-${new Date().toISOString().slice(0, 10)}.csv`;
+    const data = statisticsData;
+    const rows = [];
+    const add = (...cells) => rows.push(cells.map(csvCell).join(';'));
+    add(t('stats.title'));
+    add(t('stats.periodFilter'), t(`stats.period.${statisticsState.period}`));
+    add(t('stats.accountFilter'), statisticsState.accountId
+      ? accounts.find(account => account.id === statisticsState.accountId)?.email || statisticsState.accountId
+      : t('stats.allAccounts'));
+    add('');
+    add(t('stats.metric'), t('stats.value'));
+    for (const [key, value] of Object.entries({
+      [t('stats.total')]: data.summary?.total,
+      [t('stats.received')]: data.summary?.received,
+      [t('stats.sent')]: data.summary?.sent,
+      [t('stats.conversations')]: data.summary?.conversations,
+      [t('stats.unread')]: data.summary?.unread,
+      [t('stats.spam')]: data.summary?.spam,
+      [t('stats.attachments')]: data.summary?.attachments,
+      [t('stats.localSize')]: data.summary?.totalSize,
+    })) add(key, value);
+    add('');
+    add(t('stats.byAccount'));
+    add(t('accounts'), t('stats.received'), t('stats.sent'), t('stats.unread'), t('stats.spam'), t('stats.size'));
+    for (const row of data.byAccount || []) add(row.displayName, row.received, row.sent, row.unread, row.spam, row.totalSize);
+    add('');
+    add(t('stats.top.senders'));
+    add(t('stats.sender'), t('account.email'), t('stats.messages'), t('stats.size'));
+    for (const row of data.topSenders || []) add(row.sender, row.address, row.total, row.totalSize);
+    add('');
+    add(t('stats.top.recipients'));
+    add(t('stats.recipient'), t('stats.messages'), t('stats.size'));
+    for (const row of data.topRecipients || []) add(row.recipient, row.total, row.totalSize);
+    add('');
+    add(t('stats.labels'));
+    add(t('labels'), t('stats.messages'));
+    for (const row of data.labels || []) add(row.name, row.total);
+
+    const content = '\ufeff' + rows.join('\r\n');
+    if (button) button.disabled = true;
+    try {
+      const target = await chooseCsvExportPath(filename);
+      if (!target) return;
+      await writeTextFile(target, content);
+      status(t('stats.exported', { file: target.split(/[\\/]/).pop() }), 'success');
+    } catch (error) {
+      console.error('[FARO Mail] Export CSV statistiques :', error);
+      downloadTextFallback(filename, content, 'text/csv;charset=utf-8');
+      status(t('stats.exportFallback'), 'info');
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  async function chooseCsvExportPath(filename) {
+    if (window.Neutralino?.os?.showSaveDialog) {
+      const response = await Neutralino.os.showSaveDialog(t('stats.export'), {
+        defaultPath: filename,
+        defaultName: filename,
+        filters: [{ name: 'CSV', extensions: ['csv'] }],
+      });
+      const path = typeof response === 'string' ? response : response?.path;
+      if (!path) return '';
+      return path.toLowerCase().endsWith('.csv') ? path : `${path}.csv`;
+    }
+    return filename;
+  }
+
+  async function chooseVcardExportPath(filename) {
+    if (window.Neutralino?.os?.showSaveDialog) {
+      const response = await Neutralino.os.showSaveDialog(t('contacts.export'), {
+        defaultPath: filename,
+        defaultName: filename,
+        filters: [{ name: 'vCard', extensions: ['vcf'] }],
+      });
+      const path = typeof response === 'string' ? response : response?.path;
+      if (!path) return '';
+      return path.toLowerCase().endsWith('.vcf') ? path : `${path}.vcf`;
+    }
+    return filename;
+  }
+
+  async function exportContactsVcard() {
+    const button = document.getElementById('btn-export-contacts');
+    button.disabled = true;
+    try {
+      const { vcard, count } = await rpc('contacts.exportVcard', {});
+      if (!count) {
+        status(t('contacts.exportEmpty'), 'info');
+        return;
+      }
+      const filename = `FaroMail-contacts-${new Date().toISOString().slice(0, 10)}.vcf`;
+      const target = await chooseVcardExportPath(filename);
+      if (!target) return;
+      try {
+        await writeTextFile(target, vcard, 'text/vcard;charset=utf-8');
+        status(t('contacts.exported', { count, file: target.split(/[\\/]/).pop() }), 'success');
+      } catch (error) {
+        console.error('[FARO Mail] Export vCard :', error);
+        downloadTextFallback(filename, vcard, 'text/vcard;charset=utf-8');
+        status(t('contacts.exported', { count, file: filename }), 'success');
+      }
+    } catch (error) {
+      status(`${t('error')} : ${error.message}`, 'error');
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function writeTextFile(target, content, mimeType = 'text/csv;charset=utf-8') {
+    if (window.Neutralino?.filesystem?.writeFile && /[\\/]/.test(target)) {
+      await Neutralino.filesystem.writeFile(target, content);
+      return;
+    }
+    downloadTextFallback(target, content, mimeType);
+  }
+
+  function downloadTextFallback(filename, content, mimeType = 'text/plain;charset=utf-8') {
+    const blob = new Blob([content], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename.split(/[\\/]/).pop() || 'export.csv';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  }
+
+  function csvCell(value) {
+    const text = String(value ?? '');
+    return `"${text.replaceAll('"', '""')}"`;
+  }
+
+  function formatPercent(value, digits = 0) {
+    return `${(Number(value) || 0).toLocaleString(I18N.locale, {
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+    })} %`;
+  }
+
+  function formatDecimal(value, digits = 1) {
+    return (Number(value) || 0).toLocaleString(I18N.locale, {
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+    });
+  }
+
+  function compactNumber(value) {
+    return new Intl.NumberFormat(I18N.locale, {
+      notation: 'compact', maximumFractionDigits: 1,
+    }).format(Number(value) || 0);
+  }
+
+  // ---------- Compositeur et signatures ----------
+  let composeAttachments = [];
+  let composeMode = 'new';
+  let composeSource = null;
+  let composeQuoteText = '';
+  let composeReplyHeaders = null;
+  let composeDraftId = null;
+  let composeScheduledId = null;
+
+  function defaultSignatureProfile() {
+    return {
+      enabled: false,
+      format: 'text',
+      content: '',
+      newMessages: true,
+      replies: true,
+      forwards: true,
+      separator: true,
+      replyPosition: 'above',
+      forwardPosition: 'above',
+    };
+  }
+
+  function normalizeSignatureProfile(profile = {}) {
+    const source = { ...defaultSignatureProfile(), ...(profile || {}) };
+    return {
+      enabled: source.enabled === true,
+      format: source.format === 'html' ? 'html' : 'text',
+      content: String(source.content || ''),
+      newMessages: source.newMessages !== false,
+      replies: source.replies !== false,
+      forwards: source.forwards !== false,
+      separator: source.separator !== false,
+      replyPosition: source.replyPosition === 'below' ? 'below' : 'above',
+      forwardPosition: source.forwardPosition === 'below' ? 'below' : 'above',
+    };
+  }
+
+  function signatureProfile(accountId) {
+    return normalizeSignatureProfile(config.signatureProfiles?.[accountId]);
+  }
+
+  function isReplyMode(mode = composeMode) {
+    return mode === 'reply' || mode === 'reply-all';
+  }
+
+  function signatureApplies(profile, mode) {
+    if (!profile.enabled || !profile.content.trim()) return false;
+    if (isReplyMode(mode)) return profile.replies;
+    if (mode === 'forward') return profile.forwards;
+    return profile.newMessages;
+  }
+
+  function sanitizeSignatureHtml(html) {
+    return DOMPurify.sanitize(String(html || ''), {
+      USE_PROFILES: { html: true },
+      FORBID_TAGS: ['script', 'iframe', 'object', 'embed', 'form', 'input', 'button', 'video', 'audio'],
+      FORBID_ATTR: ['onerror', 'onload', 'onclick', 'formaction'],
+    });
+  }
+
+  function htmlToPlainText(html) {
+    const documentFragment = new DOMParser().parseFromString(sanitizeSignatureHtml(html), 'text/html');
+    return (documentFragment.body.textContent || '').replace(/\u00a0/g, ' ').trim();
+  }
+
+  function signaturePlainText(profile) {
+    const content = profile.format === 'html' ? htmlToPlainText(profile.content) : profile.content.trim();
+    if (!content) return '';
+    return `${profile.separator ? '-- \n' : ''}${content}`;
+  }
+
+  function signatureHtml(profile) {
+    const content = profile.format === 'html'
+      ? sanitizeSignatureHtml(profile.content)
+      : `<div style="white-space:pre-wrap">${esc(profile.content.trim()).replaceAll('\n', '<br>')}</div>`;
+    if (!content) return '';
+    return `<div class="faromail-signature">${profile.separator ? '<div>-- </div>' : ''}${content}</div>`;
+  }
+
+  function sourceMeta(source) {
+    return source?.meta || source || {};
+  }
+
+  function sourceText(source) {
+    const meta = sourceMeta(source);
+    return String(source?.text || meta.snippet || '').trim();
+  }
+
+  function formatSourceDate(source) {
+    const meta = sourceMeta(source);
+    const value = source?.headers?.date || meta.date;
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? '' : date.toLocaleString(I18N.locale);
+  }
+
+  function quoteOriginalMessage(source, mode) {
+    if (!source) return '';
+    const meta = sourceMeta(source);
+    const from = source?.headers?.from || meta.from_name || meta.from_addr || '';
+    const to = source?.headers?.to || meta.to_addr || '';
+    const subject = source?.headers?.subject || meta.subject || '';
+    const date = formatSourceDate(source);
+    const body = sourceText(source);
+
+    if (mode === 'forward') {
+      return [
+        '-------- ' + t('compose.forwardedMessage') + ' --------',
+        `${t('compose.from')} : ${from}`,
+        `${t('compose.date')} : ${date}`,
+        `${t('compose.subject')} : ${subject}`,
+        `${t('compose.to')} : ${to}`,
+        '',
+        body,
+      ].join('\n').trim();
+    }
+
+    const heading = t('compose.replyQuote', { sender: from, date });
+    const quoted = body.split(/\r?\n/).map(line => `> ${line}`).join('\n');
+    return `${heading}\n${quoted}`.trim();
+  }
+
+  function composeQuoteElement() {
+    return document.getElementById('compose-quote-content');
+  }
+
+  function composeQuoteEditorText() {
+    const element = composeQuoteElement();
+    if (!element) return composeQuoteText;
+    return String(element.innerText ?? element.textContent ?? '')
+      .replace(/\r\n?/g, '\n')
+      .replace(/\u00a0/g, ' ');
+  }
+
+  function syncComposeQuoteText() {
+    if (composeMode === 'new') return composeQuoteText;
+    composeQuoteText = composeQuoteEditorText();
+    return composeQuoteText;
+  }
+
+  function composePosition(profile) {
+    if (isReplyMode()) return profile.replyPosition;
+    if (composeMode === 'forward') return profile.forwardPosition;
+    return 'above';
+  }
+
+  // « Envoyer en tant que » : n'affecte que l'en-tête From/Reply-To du message
+  // envoyé (voir engine/lib/smtp.js resolveFromIdentity). La signature reste
+  // liée au compte, pas à l'identité choisie.
+  function populateComposeIdentitySelect(accountId) {
+    const field = document.getElementById('compose-identity-field');
+    const select = document.getElementById('compose-identity');
+    const account = accounts.find(item => item.id === accountId);
+    const aliases = Array.isArray(account?.aliases) ? account.aliases : [];
+    if (!aliases.length) {
+      field.classList.add('hidden');
+      select.innerHTML = '';
+      return;
+    }
+    field.classList.remove('hidden');
+    const primaryLabel = `${account.displayName || ''} <${account.email}>`.trim();
+    select.innerHTML = [`<option value="">${esc(primaryLabel)}</option>`]
+      .concat(aliases.map(alias =>
+        `<option value="${esc(alias.id)}">${esc(alias.name || alias.email)} &lt;${esc(alias.email)}&gt;</option>`))
+      .join('');
+  }
+
+  function updateComposeSignature({ resetChoice = false } = {}) {
+    const accountId = document.getElementById('compose-from').value;
+    const profile = signatureProfile(accountId);
+    const checkbox = document.getElementById('compose-use-signature');
+    const applies = signatureApplies(profile, composeMode);
+    if (resetChoice) checkbox.checked = applies;
+    checkbox.disabled = !applies;
+
+    const account = accounts.find(item => item.id === accountId);
+    document.getElementById('compose-signature-account-hint').textContent = account
+      ? t('compose.signatureForAccount', { account: account.displayName || account.email })
+      : '';
+
+    const signatureBlock = document.getElementById('compose-signature-block');
+    const quoteBlock = document.getElementById('compose-quote-block');
+    const preview = document.getElementById('compose-signature-preview');
+    const useSignature = applies && checkbox.checked;
+
+    signatureBlock.classList.toggle('hidden', !useSignature);
+    quoteBlock.classList.toggle('hidden', !composeQuoteText);
+    if (useSignature) {
+      if (profile.format === 'html') preview.innerHTML = signatureHtml(profile);
+      else preview.textContent = signaturePlainText(profile);
+      preview.classList.toggle('plain', profile.format !== 'html');
+    } else {
+      preview.innerHTML = '';
+    }
+
+    const stack = document.getElementById('compose-render-stack');
+    const position = composePosition(profile);
+    if (composeQuoteText && useSignature && position === 'below') {
+      stack.append(quoteBlock, signatureBlock);
+    } else {
+      stack.append(signatureBlock, quoteBlock);
+    }
+  }
+
+  function splitAddressTokens(value) {
+    const tokens = [];
+    let current = '';
+    let quoted = false;
+    let escaped = false;
+    let angleDepth = 0;
+
+    for (const character of String(value || '')) {
+      if (escaped) {
+        current += character;
+        escaped = false;
+        continue;
+      }
+      if (character === '\\' && quoted) {
+        current += character;
+        escaped = true;
+        continue;
+      }
+      if (character === '"') quoted = !quoted;
+      if (!quoted && character === '<') angleDepth += 1;
+      if (!quoted && character === '>' && angleDepth > 0) angleDepth -= 1;
+      if (!quoted && angleDepth === 0 && (character === ',' || character === ';')) {
+        if (current.trim()) tokens.push(current.trim());
+        current = '';
+      } else {
+        current += character;
+      }
+    }
+    if (current.trim()) tokens.push(current.trim());
+    return tokens;
+  }
+
+  function parseAddressText(value) {
+    return splitAddressTokens(value).map(token => {
+      const match = token.match(/^(.*?)<\s*([^<>]+)\s*>$/);
+      if (match) {
+        return {
+          name: match[1].trim().replace(/^"(.*)"$/, '$1').replace(/\\"/g, '"'),
+          address: match[2].trim(),
+        };
+      }
+      return { name: '', address: token.trim() };
+    }).filter(item => item.address.includes('@'));
+  }
+
+  // FARO Mail 0.2.24 UI v14 — lecture tolérante des adresses
+  function coerceAddressRows(value) {
+    if (!value) return [];
+    if (Array.isArray(value)) {
+      return value.flatMap(item => {
+        if (typeof item === 'string') return parseAddressText(item);
+        const address = String(item?.address || item?.email || '').trim();
+        if (address) return [{ name: String(item?.name || item?.displayName || '').trim(), address }];
+        return coerceAddressRows(item);
+      });
+    }
+    if (typeof value === 'object') {
+      if (Array.isArray(value.value)) return coerceAddressRows(value.value);
+      if (typeof value.text === 'string') return parseAddressText(value.text);
+      const address = String(value.address || value.email || '').trim();
+      return address ? [{ name: String(value.name || value.displayName || '').trim(), address }] : [];
+    }
+    return parseAddressText(String(value));
+  }
+
+  function headerAddressList(source, name, fallback = '') {
+    const headers = source?.headers || {};
+    const structured = coerceAddressRows(headers[`${name}List`]);
+    if (structured.length) return structured;
+    const textual = coerceAddressRows(headers[name]);
+    if (textual.length) return textual;
+    return coerceAddressRows(fallback);
+  }
+
+
+  function normalizeRecipientAddress(value) {
+    return String(value || '').trim().toLocaleLowerCase('en-US');
+  }
+
+  function formatRecipientAddress(item) {
+    const address = String(item?.address || '').trim();
+    const name = String(item?.name || '').trim();
+    if (!address) return '';
+    if (!name) return address;
+    return `"${name.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}" <${address}>`;
+  }
+
+  function uniqueAddressList(rows, excluded = new Set()) {
+    const seen = new Set(excluded);
+    const result = [];
+    for (const row of rows || []) {
+      const key = normalizeRecipientAddress(row?.address);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      result.push(row);
+    }
+    return result;
+  }
+
+  function ownAddressSet(accountId) {
+    const values = accounts.flatMap(account => [account.email]);
+    const selected = accounts.find(account => String(account.id) === String(accountId));
+    if (selected?.email) values.push(selected.email);
+    return new Set(values.map(normalizeRecipientAddress).filter(Boolean));
+  }
+
+  function replyRecipients(source, mode, accountId) {
+    const meta = sourceMeta(source);
+    const outgoing = meta.folder_role === 'sent';
+    const own = ownAddressSet(accountId);
+    const fromList = headerAddressList(source, 'from', [
+      meta.from_name && meta.from_addr
+        ? `"${String(meta.from_name).replaceAll('"', '\\"')}" <${meta.from_addr}>`
+        : meta.from_addr,
+    ].filter(Boolean).join(', '));
+    const replyToList = headerAddressList(source, 'replyTo');
+    const toList = headerAddressList(source, 'to', meta.to_addr || '');
+    const ccList = headerAddressList(source, 'cc', meta.cc_addr || '');
+    const correspondentList = coerceAddressRows({
+      name: source?.correspondent?.name || '',
+      address: source?.correspondent?.email || '',
+    });
+
+    const choosePrimary = rows => {
+      const all = uniqueAddressList(rows);
+      const external = uniqueAddressList(all, own);
+      // Ne jamais laisser « Répondre » vide pour un message échangé entre
+      // deux comptes configurés dans FARO Mail : si tout est à nous, on garde
+      // malgré tout le destinataire réel du message.
+      return external.length ? external : all;
+    };
+
+    const fallbackRows = outgoing
+      ? [...toList, ...correspondentList, ...coerceAddressRows(meta.to_addr)]
+      : [...replyToList, ...fromList, ...correspondentList, ...coerceAddressRows(meta.from_addr)];
+
+    let to = choosePrimary(outgoing
+      ? [...toList, ...correspondentList]
+      : [...(replyToList.length ? replyToList : fromList), ...correspondentList]);
+    if (!to.length) to = choosePrimary(fallbackRows);
+
+    let cc = [];
+    if (mode === 'reply-all') {
+      const excluded = new Set([
+        ...own,
+        ...to.map(item => normalizeRecipientAddress(item.address)),
+      ]);
+      const extraRows = outgoing ? ccList : [...toList, ...ccList];
+      cc = uniqueAddressList(extraRows, excluded);
+    }
+
+    return {
+      to: to.map(formatRecipientAddress).filter(Boolean).join(', '),
+      cc: cc.map(formatRecipientAddress).filter(Boolean).join(', '),
+    };
+  }
+
+
+  function openCompose(source = null, mode = 'new') {
+    composeDraftId = null;
+    composeScheduledId = null;
+    window.OutboxUI?.toggleScheduleControls?.(false);
+    composeMode = mode;
+    composeSource = source;
+    composeAttachments = [];
+    composeQuoteText = mode === 'new' ? '' : quoteOriginalMessage(source, mode);
+    composeReplyHeaders = isReplyMode(mode) ? {
+      inReplyTo: source?.headers?.messageId || sourceMeta(source).message_id || undefined,
+      references: source?.headers?.references || undefined,
+    } : null;
+
+    document.getElementById('compose-attachments').innerHTML = '';
+    const from = document.getElementById('compose-from');
+    from.innerHTML = accounts.map(account =>
+      `<option value="${esc(account.id)}" ${account.id === config.defaultAccountId ? 'selected' : ''}>
+        ${esc(account.displayName || '')} &lt;${esc(account.email)}&gt;</option>`).join('');
+
+    const meta = sourceMeta(source);
+    if (source && meta.account_id) from.value = meta.account_id;
+    populateComposeIdentitySelect(from.value);
+
+    const toInput = document.getElementById('compose-to');
+    const ccInput = document.getElementById('compose-cc');
+    const bccInput = document.getElementById('compose-bcc');
+    const subjectInput = document.getElementById('compose-subject');
+    const bodyInput = document.getElementById('compose-body');
+    ccInput.value = '';
+    bccInput.value = '';
+    setComposeEditorContent();
+    document.getElementById('compose-read-receipt').checked = false;
+    document.getElementById('compose-delivery-receipt').checked = false;
+
+    if (isReplyMode(mode) && source) {
+      const recipients = replyRecipients(source, mode, from.value);
+      toInput.value = recipients.to;
+      ccInput.value = recipients.cc;
+      subjectInput.value = /^re\s*:/i.test(meta.subject || '') ? meta.subject : 'Re: ' + (meta.subject || '');
+    } else if (mode === 'forward' && source) {
+      toInput.value = '';
+      const prefix = I18N.locale === 'fr' ? 'Tr: ' : I18N.locale === 'de' ? 'WG: ' : 'Fwd: ';
+      subjectInput.value = /^(tr|fwd?|wg)\s*:/i.test(meta.subject || '') ? meta.subject : prefix + (meta.subject || '');
+    } else {
+      toInput.value = '';
+      subjectInput.value = '';
+    }
+
+    document.getElementById('compose-modal-title').textContent = t(
+      mode === 'reply-all' ? 'compose.replyAllTitle'
+        : mode === 'reply' ? 'compose.replyTitle'
+          : mode === 'forward' ? 'compose.forwardTitle'
+            : 'compose.title');
+    document.getElementById('compose-quote-title').textContent = t(
+      mode === 'forward' ? 'compose.forwardedMessage' : 'compose.quotedMessage');
+    document.getElementById('compose-quote-content').textContent = composeQuoteText;
+    updateComposeSignature({ resetChoice: true });
+    setComposeEmojiPickerOpen(false);
+    openModal('compose-modal');
+    prepareComposeEditorForMode(mode, { focusRecipient: mode === 'new' });
+  }
+
+  // FARO Mail 0.2.24 UI v14 — destinataires et édition enrichie fiables
+  // FARO Mail 0.2.24 UI v9 — éditeur enrichi et carnet d'adresses
+  let composeSavedSelection = null;
+  let composeContactPickerTarget = 'compose-to';
+  let composeContactPickerRows = [];
+
+  function composeEditorElement() {
+    return document.getElementById('compose-body');
+  }
+
+  function sanitizeComposeBodyHtml(html) {
+    return DOMPurify.sanitize(String(html || ''), {
+      ALLOWED_TAGS: ['div', 'p', 'br', 'strong', 'b', 'em', 'i', 'u', 's', 'ul', 'ol', 'li', 'a', 'blockquote', 'span'],
+      ALLOWED_ATTR: ['href', 'title'],
+      ALLOW_DATA_ATTR: false,
+      FORBID_TAGS: ['script', 'style', 'iframe', 'object', 'embed', 'form', 'input', 'button', 'video', 'audio', 'img'],
+      FORBID_ATTR: ['onerror', 'onload', 'onclick', 'formaction', 'style', 'class', 'id'],
+    });
+  }
+
+  function plainTextToComposeHtml(text) {
+    const normalized = String(text || '').replace(/\r\n?/g, '\n');
+    if (!normalized) return '';
+    return normalized.split('\n').map(line => line
+      ? `<div>${esc(line)}</div>`
+      : '<div><br></div>').join('');
+  }
+
+  // FARO Mail 0.2.24 UI v12 — caractère d'ancrage WebKitGTK retiré à l'envoi
+  const COMPOSE_EDITOR_ANCHOR = '\u200B';
+
+  function stripComposeEditorAnchor(value) {
+    return String(value || '').replace(/\u200B/g, '');
+  }
+
+  function composeEditorText() {
+    const editor = composeEditorElement();
+    return stripComposeEditorAnchor(editor?.innerText || '')
+      .replace(/\u00a0/g, ' ')
+      .replace(/\r\n?/g, '\n')
+      .trimEnd();
+  }
+
+  function composeEditorHtml() {
+    const editor = composeEditorElement();
+    if (!editor || !composeEditorText().trim()) return '';
+    return sanitizeComposeBodyHtml(stripComposeEditorAnchor(editor.innerHTML)).trim();
+  }
+
+  function setComposeEditorContent({ html = '', text = '' } = {}) {
+    const editor = composeEditorElement();
+    if (!editor) return;
+    const safeHtml = html ? sanitizeComposeBodyHtml(html) : plainTextToComposeHtml(text);
+    editor.innerHTML = safeHtml === '<br>' ? '' : safeHtml;
+    composeSavedSelection = null;
+    if (!stripComposeEditorAnchor(editor.innerText).trim()) ensureComposeEditorInsertionPoint();
+  }
+
+
+
+  // FARO Mail 0.2.24 UI v12 — ancrage réel pour l'éditeur WebKitGTK
+  function activateComposeEditor() {
+    const editor = composeEditorElement();
+    if (!editor) return null;
+    editor.setAttribute('contenteditable', 'true');
+    editor.setAttribute('tabindex', '0');
+    editor.removeAttribute('inert');
+    editor.removeAttribute('aria-disabled');
+    editor.style.pointerEvents = 'auto';
+    editor.style.userSelect = 'text';
+    return editor;
+  }
+
+  function composeEditorHasVisibleContent(editor) {
+    return Boolean(stripComposeEditorAnchor(editor?.innerText || '').trim());
+  }
+
+  function ensureComposeEditorInsertionPoint() {
+    const editor = activateComposeEditor();
+    if (!editor) return null;
+
+    // WebKitGTK peut considérer un contenteditable vide, <br> ou <p><br></p>
+    // comme éditable dans le DOM tout en refusant toute saisie. Un vrai nœud
+    // texte invisible fournit un point d'insertion stable.
+    if (!composeEditorHasVisibleContent(editor)) {
+      let anchor = editor.querySelector('[data-compose-editor-anchor]');
+      if (!anchor) {
+        editor.innerHTML = '';
+        anchor = document.createElement('div');
+        anchor.dataset.composeEditorAnchor = 'true';
+        anchor.append(document.createTextNode(COMPOSE_EDITOR_ANCHOR));
+        editor.append(anchor);
+      } else if (!anchor.firstChild) {
+        anchor.append(document.createTextNode(COMPOSE_EDITOR_ANCHOR));
+      }
+    }
+    return editor;
+  }
+
+  function composeEditorAnchorNode(editor) {
+    const anchor = editor?.querySelector('[data-compose-editor-anchor]') || editor?.firstChild;
+    if (!anchor) return null;
+    if (anchor.nodeType === Node.TEXT_NODE) return anchor;
+    if (!anchor.firstChild) anchor.append(document.createTextNode(COMPOSE_EDITOR_ANCHOR));
+    return anchor.firstChild;
+  }
+
+  function resetComposeViewport() {
+    const modal = document.querySelector('#compose-modal .compose-modal-box');
+    const body = document.querySelector('#compose-modal .compose-modal-body');
+    if (modal) modal.scrollTop = 0;
+    if (body) body.scrollTop = 0;
+  }
+
+  function focusComposeEditorAtStart({ scroll = true } = {}) {
+    const editor = ensureComposeEditorInsertionPoint();
+    const selection = editor?.ownerDocument?.getSelection?.() || window.getSelection?.();
+    if (!editor) return;
+
+    editor.focus({ preventScroll: true });
+    try {
+      const node = composeEditorAnchorNode(editor);
+      const range = document.createRange();
+      if (node?.nodeType === Node.TEXT_NODE) {
+        // Après le caractère d'ancrage : la frappe s'insère réellement dans
+        // l'éditeur, sans que ce caractère ne soit envoyé dans le message.
+        range.setStart(node, node.nodeValue?.length || 0);
+      } else {
+        range.setStart(editor, 0);
+      }
+      range.collapse(true);
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+      composeSavedSelection = range.cloneRange();
+    } catch {
+      editor.focus();
+    }
+
+    if (scroll) {
+      try { editor.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' }); } catch {}
+    }
+  }
+
+  function prepareComposeEditorForMode(mode = composeMode, { focusRecipient = false } = {}) {
+    const editor = ensureComposeEditorInsertionPoint();
+    if (!editor) return;
+    resetComposeViewport();
+    const focusPrimaryField = () => {
+      if (focusRecipient && mode === 'new') {
+        const input = document.getElementById('compose-to');
+        if (input) {
+          input.focus({ preventScroll: true });
+          try { input.setSelectionRange(input.value.length, input.value.length); } catch {}
+          return;
+        }
+      }
+      focusComposeEditorAtStart({ scroll: true });
+    };
+    requestAnimationFrame(() => {
+      requestAnimationFrame(focusPrimaryField);
+    });
+    setTimeout(focusPrimaryField, 120);
+  }
+
+  function maintainComposeEditorInsertionPoint() {
+    const editor = composeEditorElement();
+    if (!editor) return;
+    if (!composeEditorHasVisibleContent(editor)) {
+      ensureComposeEditorInsertionPoint();
+      focusComposeEditorAtStart({ scroll: false });
+    }
+  }
+
+  function focusComposeEditorFromQuote() {
+    focusComposeEditorAtStart({ scroll: true });
+  }
+
+  function rememberComposeSelection() {
+    const editor = composeEditorElement();
+    const selection = window.getSelection?.();
+    if (!editor || !selection || !selection.rangeCount) return;
+    const range = selection.getRangeAt(0);
+    if (editor.contains(range.commonAncestorContainer)) composeSavedSelection = range.cloneRange();
+  }
+
+  function selectionBelongsToComposeEditor(range, editor = composeEditorElement()) {
+    return Boolean(range && editor && editor.contains(range.commonAncestorContainer));
+  }
+
+  function fallbackComposeRange(editor) {
+    const range = document.createRange();
+    const node = composeEditorAnchorNode(editor);
+    if (node?.nodeType === Node.TEXT_NODE) {
+      range.setStart(node, node.nodeValue?.length || 0);
+    } else {
+      range.selectNodeContents(editor);
+      range.collapse(false);
+    }
+    range.collapse(true);
+    return range;
+  }
+
+  function restoreComposeSelection() {
+    const editor = ensureComposeEditorInsertionPoint();
+    const selection = window.getSelection?.();
+    if (!editor || !selection) return null;
+
+    let range = null;
+    try {
+      if (selectionBelongsToComposeEditor(composeSavedSelection, editor)) {
+        range = composeSavedSelection.cloneRange();
+      } else if (selection.rangeCount && selectionBelongsToComposeEditor(selection.getRangeAt(0), editor)) {
+        range = selection.getRangeAt(0).cloneRange();
+      }
+    } catch {
+      composeSavedSelection = null;
+    }
+    if (!range) range = fallbackComposeRange(editor);
+
+    editor.focus({ preventScroll: true });
+    try {
+      selection.removeAllRanges();
+      selection.addRange(range);
+      composeSavedSelection = range.cloneRange();
+    } catch {
+      range = fallbackComposeRange(editor);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      composeSavedSelection = range.cloneRange();
+    }
+    return range;
+  }
+
+  function runComposeFormatCommand(command, value = null) {
+    const range = restoreComposeSelection();
+    if (!range) return false;
+    let result = false;
+    try { result = document.execCommand(command, false, value); } catch {}
+    rememberComposeSelection();
+    composeEditorElement()?.dispatchEvent(new Event('input', { bubbles: true }));
+    return result;
+  }
+
+  function removeInlineFormattingFromFragment(fragment) {
+    const inlineTags = new Set(['A', 'B', 'STRONG', 'I', 'EM', 'U', 'S', 'STRIKE', 'SPAN', 'FONT']);
+    const elements = [...fragment.querySelectorAll('*')];
+    for (const element of elements) {
+      for (const attribute of [...element.attributes]) element.removeAttribute(attribute.name);
+    }
+    for (const element of elements.reverse()) {
+      if (!inlineTags.has(element.tagName) || !element.parentNode) continue;
+      const parent = element.parentNode;
+      while (element.firstChild) parent.insertBefore(element.firstChild, element);
+      parent.removeChild(element);
+    }
+    return fragment;
+  }
+
+  function clearComposeFormatting() {
+    const editor = ensureComposeEditorInsertionPoint();
+    const range = restoreComposeSelection();
+    const selection = window.getSelection?.();
+    if (!editor || !range || !selection) return;
+
+    if (range.collapsed) {
+      try { document.execCommand('removeFormat', false, null); } catch {}
+      try { document.execCommand('unlink', false, null); } catch {}
+      rememberComposeSelection();
+      return;
+    }
+
+    const fragment = removeInlineFormattingFromFragment(range.extractContents());
+    const insertedNodes = [...fragment.childNodes];
+    range.insertNode(fragment);
+
+    if (insertedNodes.length) {
+      const cleanRange = document.createRange();
+      cleanRange.setStartBefore(insertedNodes[0]);
+      cleanRange.setEndAfter(insertedNodes[insertedNodes.length - 1]);
+      selection.removeAllRanges();
+      selection.addRange(cleanRange);
+      composeSavedSelection = cleanRange.cloneRange();
+    } else {
+      composeSavedSelection = fallbackComposeRange(editor);
+    }
+    editor.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+
+  function insertComposeTextAtSelection(value) {
+    const text = String(value || '');
+    if (!text) return;
+    const editor = ensureComposeEditorInsertionPoint();
+    const range = restoreComposeSelection();
+    const selection = window.getSelection?.();
+    if (!editor || !range || !selection) return;
+
+    range.deleteContents();
+    const textNode = document.createTextNode(text);
+    range.insertNode(textNode);
+    range.setStartAfter(textNode);
+    range.collapse(true);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    composeSavedSelection = range.cloneRange();
+    editor.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+
+  function normalizeComposeLink(value) {
+    let url = String(value || '').trim();
+    if (!url) return '';
+    if (!/^[a-z][a-z0-9+.-]*:/i.test(url)) url = `https://${url}`;
+    return /^(https?:|mailto:)/i.test(url) ? url : '';
+  }
+
+  function addComposeLink() {
+    restoreComposeSelection();
+    const selection = window.getSelection?.();
+    const selectedText = selection && !selection.isCollapsed ? selection.toString().trim() : '';
+    const proposed = selectedText.includes('@') ? `mailto:${selectedText}` : 'https://';
+    const url = normalizeComposeLink(window.prompt(t('compose.linkPrompt'), proposed));
+    if (!url) return;
+    if (selection && !selection.isCollapsed) {
+      runComposeFormatCommand('createLink', url);
+    } else {
+      runComposeFormatCommand('insertHTML', `<a href="${esc(url)}">${esc(url)}</a>`);
+    }
+  }
+
+  function setComposeEmojiPickerOpen(open) {
+    const picker = document.getElementById('compose-emoji-picker');
+    const button = document.getElementById('btn-compose-emoji');
+    if (!picker) return;
+    picker.classList.toggle('hidden', !open);
+    picker.classList.toggle('open', Boolean(open));
+    picker.setAttribute('aria-hidden', open ? 'false' : 'true');
+    button?.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+
+  function toggleComposeEmojiPicker() {
+    const picker = document.getElementById('compose-emoji-picker');
+    setComposeEmojiPickerOpen(!picker?.classList.contains('open'));
+  }
+
+  function insertComposeEmoji(emoji) {
+    insertComposeTextAtSelection(emoji);
+    setComposeEmojiPickerOpen(false);
+  }
+  function closeComposeContactPicker() {
+    document.getElementById('compose-contact-picker-modal')?.classList.remove('open');
+  }
+
+  function contactEmailRows(contacts) {
+    const rows = [];
+    const seen = new Set();
+    for (const contact of contacts || []) {
+      const candidates = Array.isArray(contact?.emails)
+        ? contact.emails.map(item => typeof item === 'string' ? item : item?.email)
+        : [];
+      candidates.push(contact?.primaryEmail, contact?.email);
+      for (const candidate of candidates) {
+        const email = String(candidate || '').trim();
+        const key = normalizeRecipientAddress(email);
+        if (!email.includes('@') || !key || seen.has(key)) continue;
+        seen.add(key);
+        rows.push({
+          email,
+          displayName: String(contact?.displayName || contact?.firstName || contact?.lastName || '').trim(),
+          company: String(contact?.company || '').trim(),
+          avatarData: contact?.avatarData || '',
+          favorite: Boolean(contact?.favorite),
+          trusted: Boolean(contact?.trusted),
+        });
+      }
+    }
+    return rows.sort((left, right) =>
+      (left.displayName || left.email).localeCompare(right.displayName || right.email, I18N.locale));
+  }
+
+  function renderComposeContactPicker() {
+    const list = document.getElementById('compose-contact-picker-list');
+    const empty = document.getElementById('compose-contact-picker-empty');
+    if (!list || !empty) return;
+    const query = String(document.getElementById('compose-contact-search')?.value || '').trim().toLocaleLowerCase(I18N.locale);
+    const filtered = composeContactPickerRows
+      .map((row, index) => ({ row, index }))
+      .filter(({ row }) => !query || [row.displayName, row.email, row.company]
+        .some(value => String(value || '').toLocaleLowerCase(I18N.locale).includes(query)));
+
+    list.innerHTML = filtered.map(({ row, index }) => `
+      <label class="compose-contact-picker-row">
+        <input type="checkbox" data-compose-contact-index="${index}">
+        <span class="compose-contact-picker-avatar">${esc(contactInitials(row))}</span>
+        <span class="compose-contact-picker-main"><strong>${esc(row.displayName || row.email)}</strong><span>${esc(row.email)}${row.company ? ` · ${esc(row.company)}` : ''}</span></span>
+        <span class="compose-contact-picker-meta">${row.favorite ? '<i class="fa-solid fa-star"></i>' : ''}${row.trusted ? '<i class="fa-solid fa-shield-halved"></i>' : ''}</span>
+      </label>`).join('');
+    empty.classList.toggle('hidden', filtered.length > 0);
+    list.classList.toggle('hidden', filtered.length === 0);
+  }
+
+  async function openComposeContactPicker(targetInputId = 'compose-to') {
+    composeContactPickerTarget = ['compose-to', 'compose-cc', 'compose-bcc'].includes(targetInputId)
+      ? targetInputId
+      : 'compose-to';
+    const target = document.getElementById('compose-contact-target');
+    const search = document.getElementById('compose-contact-search');
+    const list = document.getElementById('compose-contact-picker-list');
+    if (target) target.value = composeContactPickerTarget;
+    if (search) search.value = '';
+    if (list) list.innerHTML = `<div class="compose-contact-picker-loading"><i class="fa-solid fa-circle-notch fa-spin"></i>${esc(t('compose.addressBookLoading'))}</div>`;
+    document.getElementById('compose-contact-picker-empty')?.classList.add('hidden');
+    openModal('compose-contact-picker-modal');
+    try {
+      const result = await rpc('contacts.list', { limit: 1000 });
+      composeContactPickerRows = contactEmailRows(Array.isArray(result?.rows) ? result.rows : []);
+      renderComposeContactPicker();
+      setTimeout(() => search?.focus(), 0);
+    } catch (error) {
+      composeContactPickerRows = [];
+      renderComposeContactPicker();
+      status(`${t('error')} : ${error.message}`, 'error');
+    }
+  }
+
+  function addSelectedComposeContacts() {
+    const targetId = document.getElementById('compose-contact-target')?.value || composeContactPickerTarget;
+    const input = document.getElementById(targetId);
+    if (!input) return;
+    const selected = [...document.querySelectorAll('#compose-contact-picker-list [data-compose-contact-index]:checked')]
+      .map(checkbox => composeContactPickerRows[Number(checkbox.dataset.composeContactIndex)])
+      .filter(Boolean);
+    if (!selected.length) {
+      status(t('compose.addressBookNoneSelected'), 'info');
+      return;
+    }
+    const existingAddresses = new Set(parseAddressText(input.value)
+      .map(item => normalizeRecipientAddress(item.address))
+      .filter(Boolean));
+    const additions = [];
+    for (const row of selected) {
+      const key = normalizeRecipientAddress(row.email);
+      if (!key || existingAddresses.has(key)) continue;
+      existingAddresses.add(key);
+      additions.push(formatRecipientAddress({ name: row.displayName, address: row.email }));
+    }
+    if (!additions.length) {
+      status(t('compose.addressBookAlreadyPresent'), 'info');
+      return;
+    }
+    const current = String(input.value || '').trim().replace(/[\s,;]+$/, '');
+    input.value = [current, ...additions].filter(Boolean).join(', ') + ', ';
+    closeComposeContactPicker();
+    input.focus();
+    status(t('compose.addressBookAdded', { count: additions.length }), 'success');
+  }
+
+  function buildOutgoingMessage() {
+    syncComposeQuoteText();
+    const accountId = document.getElementById('compose-from').value;
+    const profile = signatureProfile(accountId);
+    const useSignature = !document.getElementById('compose-use-signature').disabled
+      && document.getElementById('compose-use-signature').checked;
+    const body = composeEditorText();
+    const bodyHtml = composeEditorHtml();
+    const signatureText = useSignature ? signaturePlainText(profile) : '';
+    const position = composePosition(profile);
+    const textParts = [body];
+
+    if (composeQuoteText) {
+      if (useSignature && position === 'above') textParts.push(signatureText);
+      textParts.push(composeQuoteText);
+      if (useSignature && position === 'below') textParts.push(signatureText);
+    } else if (useSignature) {
+      textParts.push(signatureText);
+    }
+
+    const text = textParts.filter(part => String(part || '').trim()).join('\n\n');
+    const bodyHtmlBlock = bodyHtml ? `<div class="faromail-body">${bodyHtml}</div>` : '';
+    const quoteHtml = composeQuoteText
+      ? `<blockquote style="margin:16px 0;padding-left:12px;border-left:3px solid #bbb;white-space:pre-wrap">${esc(composeQuoteText).replaceAll('\n', '<br>')}</blockquote>`
+      : '';
+    const sigHtml = useSignature ? signatureHtml(profile) : '';
+    const htmlParts = [bodyHtmlBlock];
+
+    if (quoteHtml) {
+      if (useSignature && position === 'above') htmlParts.push(sigHtml);
+      htmlParts.push(quoteHtml);
+      if (useSignature && position === 'below') htmlParts.push(sigHtml);
+    } else if (useSignature) {
+      htmlParts.push(sigHtml);
+    }
+
+    const html = htmlParts.filter(Boolean).join('<br>') || undefined;
+    return { text, html, accountId };
+  }
+
+  function renderComposeAttachments() {
+    const container = document.getElementById('compose-attachments');
+    if (!container) return;
+    container.innerHTML = composeAttachments.map(attachment =>
+      `<span class="att-chip"><i class="fa-solid fa-paperclip"></i>${esc(attachment.filename || attachment.path || '')}</span>`
+    ).join('');
+  }
+
+  function composeState() {
+    syncComposeQuoteText();
+    return {
+      accountId: document.getElementById('compose-from').value,
+      fromIdentity: document.getElementById('compose-identity').value || undefined,
+      to: document.getElementById('compose-to').value,
+      cc: document.getElementById('compose-cc').value,
+      bcc: document.getElementById('compose-bcc').value,
+      subject: document.getElementById('compose-subject').value,
+      body: composeEditorText(),
+      bodyHtml: composeEditorHtml(),
+      mode: composeMode,
+      quoteText: composeQuoteText,
+      replyHeaders: composeReplyHeaders,
+      useSignature: document.getElementById('compose-use-signature').checked,
+      readReceipt: document.getElementById('compose-read-receipt').checked,
+      deliveryReceipt: document.getElementById('compose-delivery-receipt').checked,
+      attachments: composeAttachments.map(item => ({ ...item })),
+    };
+  }
+
+  function composeEnvelope() {
+    const outgoing = buildOutgoingMessage();
+    return {
+      accountId: outgoing.accountId,
+      mail: {
+        fromIdentity: document.getElementById('compose-identity').value || undefined,
+        to: document.getElementById('compose-to').value,
+        cc: document.getElementById('compose-cc').value || undefined,
+        bcc: document.getElementById('compose-bcc').value || undefined,
+        subject: document.getElementById('compose-subject').value,
+        text: outgoing.text,
+        html: outgoing.html,
+        readReceipt: document.getElementById('compose-read-receipt').checked,
+        deliveryReceipt: document.getElementById('compose-delivery-receipt').checked,
+        inReplyTo: composeReplyHeaders?.inReplyTo,
+        references: composeReplyHeaders?.references,
+        attachments: composeAttachments.map(item => ({ ...item })),
+      },
+    };
+  }
+
+  function composeContext() {
+    return { draftId: composeDraftId, scheduledId: composeScheduledId };
+  }
+
+  function setComposeContext({ draftId = null, scheduledId = null } = {}) {
+    composeDraftId = draftId ? Number(draftId) : null;
+    composeScheduledId = scheduledId ? Number(scheduledId) : null;
+  }
+
+  function loadComposeState(state = {}, context = {}) {
+    openCompose(null, state.mode || 'new');
+    setComposeContext(context);
+    const from = document.getElementById('compose-from');
+    if (state.accountId && [...from.options].some(option => option.value === String(state.accountId))) {
+      from.value = String(state.accountId);
+    }
+    populateComposeIdentitySelect(from.value);
+    const identitySelect = document.getElementById('compose-identity');
+    if (state.fromIdentity && [...identitySelect.options].some(option => option.value === String(state.fromIdentity))) {
+      identitySelect.value = String(state.fromIdentity);
+    }
+    document.getElementById('compose-to').value = state.to || '';
+    document.getElementById('compose-cc').value = state.cc || '';
+    document.getElementById('compose-bcc').value = state.bcc || '';
+    document.getElementById('compose-subject').value = state.subject || '';
+    setComposeEditorContent({ html: state.bodyHtml || '', text: state.body || '' });
+    document.getElementById('compose-read-receipt').checked = Boolean(state.readReceipt);
+    document.getElementById('compose-delivery-receipt').checked = Boolean(state.deliveryReceipt);
+    composeMode = ['new', 'reply', 'reply-all', 'forward'].includes(state.mode) ? state.mode : 'new';
+    composeQuoteText = String(state.quoteText || '');
+    composeReplyHeaders = state.replyHeaders && typeof state.replyHeaders === 'object'
+      ? { ...state.replyHeaders }
+      : null;
+    composeAttachments = Array.isArray(state.attachments)
+      ? state.attachments.map(item => ({ ...item }))
+      : [];
+    document.getElementById('compose-quote-content').textContent = composeQuoteText;
+    renderComposeAttachments();
+    updateComposeSignature({ resetChoice: false });
+    const signature = document.getElementById('compose-use-signature');
+    if (!signature.disabled) signature.checked = state.useSignature !== false;
+    updateComposeSignature({ resetChoice: false });
+    if (context.scheduledId || context.sendAt) {
+      window.OutboxUI?.toggleScheduleControls?.(true);
+      const input = document.getElementById('compose-send-at');
+      if (input) input.value = window.OutboxUI?.localDateTimeValue?.(context.sendAt) || '';
+    }
+    prepareComposeEditorForMode(composeMode);
+  }
+
+  function preserveComposeEditingShortcuts(event) {
+    if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
+    const key = String(event.key || '').toLowerCase();
+    if (!['a', 'c', 'x', 'v', 'z', 'y'].includes(key)) return;
+    // Copier/couper/coller/sélectionner restent gérés nativement par le WebView.
+    // Pour annuler/rétablir, execCommand conserve la pile d'édition contenteditable
+    // utilisée par l'éditeur actuel et fiabilise le comportement sous WebKitGTK.
+    event.stopPropagation();
+    const undo = key === 'z' && !event.shiftKey;
+    const redo = key === 'y' || (key === 'z' && event.shiftKey);
+    if (!undo && !redo) return;
+    event.preventDefault();
+    try {
+      document.execCommand(undo ? 'undo' : 'redo', false, null);
+      maintainComposeEditorInsertionPoint();
+      rememberComposeSelection();
+    } catch {}
+  }
+
+  // FARO Mail 0.2.24 UI v8 — sélecteur HTML fiable pour les pièces jointes
+  function composeAttachmentPathSeparator() {
+    return String(typeof NL_OS === 'undefined' ? '' : NL_OS) === 'Windows' ? '\\' : '/';
+  }
+
+  function composeAttachmentStorageDirectory() {
+    const separator = composeAttachmentPathSeparator();
+    const base = String(typeof NL_PATH === 'undefined' ? '.' : NL_PATH).replace(/[\\/]+$/, '');
+    return `${base}${separator}data${separator}compose-attachments`;
+  }
+
+  function joinComposeAttachmentPath(directory, filename) {
+    return `${String(directory || '').replace(/[\\/]+$/, '')}${composeAttachmentPathSeparator()}${filename}`;
+  }
+
+  function safeComposeAttachmentFilename(value) {
+    let filename = String(value || 'piece-jointe')
+      .replace(/[\u0000-\u001f<>:"/\\|?*]/g, '_')
+      .replace(/[. ]+$/g, '')
+      .trim();
+    if (!filename) filename = 'piece-jointe';
+    if (filename.length <= 160) return filename;
+    const dot = filename.lastIndexOf('.');
+    const extension = dot > 0 && filename.length - dot <= 16 ? filename.slice(dot) : '';
+    return `${filename.slice(0, 160 - extension.length)}${extension}`;
+  }
+
+  function composeAttachmentSourceKey(file) {
+    return [String(file?.name || ''), Number(file?.size) || 0, Number(file?.lastModified) || 0].join('\u0000');
+  }
+
+  function readComposeAttachmentFile(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (reader.result instanceof ArrayBuffer) resolve(reader.result);
+        else reject(new Error(t('compose.attachCopyError', { name: file?.name || '' })));
+      };
+      reader.onerror = () => reject(new Error(t('compose.attachCopyError', { name: file?.name || '' })));
+      reader.readAsArrayBuffer(file);
+    });
+  }
+
+  async function copyComposeAttachmentFile(file, directory) {
+    const originalName = String(file?.name || 'piece-jointe');
+    const safeName = safeComposeAttachmentFilename(originalName);
+    const token = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    const targetPath = joinComposeAttachmentPath(directory, `${token}-${safeName}`);
+    const content = await readComposeAttachmentFile(file);
+    await Neutralino.filesystem.writeBinaryFile(targetPath, content);
+    return {
+      filename: originalName,
+      path: targetPath,
+      sourceKey: composeAttachmentSourceKey(file),
+      managedCopy: true,
+      size: Number(file?.size) || 0,
+    };
+  }
+
+  async function importComposeAttachmentFiles(files) {
+    const selectedFiles = Array.from(files || []).filter(file => file && typeof file.name === 'string');
+    if (!selectedFiles.length) return;
+
+    const button = document.getElementById('btn-attach');
+    const existingSources = new Set(composeAttachments.map(item => String(item.sourceKey || '')).filter(Boolean));
+    const directory = composeAttachmentStorageDirectory();
+    let added = 0;
+    const failures = [];
+
+    if (button) button.disabled = true;
+    status(t('compose.attachPreparing'), 'busy');
+    try {
+      try { await Neutralino.filesystem.createDirectory(directory); } catch {}
+      for (const file of selectedFiles) {
+        const sourceKey = composeAttachmentSourceKey(file);
+        if (existingSources.has(sourceKey)) continue;
+        try {
+          const attachment = await copyComposeAttachmentFile(file, directory);
+          composeAttachments.push(attachment);
+          existingSources.add(sourceKey);
+          added++;
+        } catch (error) {
+          console.error('[FARO Mail] Impossible de préparer la pièce jointe :', file?.name, error);
+          failures.push(String(file?.name || ''));
+        }
+      }
+      if (added) {
+        renderComposeAttachments();
+        reportAddedComposeAttachments(added);
+      }
+      if (failures.length) {
+        status(t('compose.attachCopyError', { name: failures[0] }), 'error');
+      } else if (!added) {
+        status(t('compose.attachAlreadyAdded'), 'info');
+      }
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  function normalizeComposeAttachmentPath(value) {
+    let filePath = String(value || '').trim();
+    if (!filePath) return '';
+    if (/^file:\/\//i.test(filePath)) {
+      try {
+        const url = new URL(filePath);
+        if (url.protocol !== 'file:') return '';
+        const host = url.hostname && url.hostname !== 'localhost' ? `//${url.hostname}` : '';
+        filePath = host + decodeURIComponent(url.pathname || '');
+        if (/^\/[A-Za-z]:\//.test(filePath)) filePath = filePath.slice(1);
+      } catch {
+        return '';
+      }
+    }
+    return filePath;
+  }
+
+  function addComposeAttachmentPaths(paths = []) {
+    const existing = new Set(composeAttachments.map(item => String(item.path || '')));
+    let added = 0;
+    for (const rawPath of paths || []) {
+      const filePath = normalizeComposeAttachmentPath(rawPath);
+      if (!filePath || existing.has(filePath)) continue;
+      const filename = filePath.split(/[\\/]/).pop() || filePath;
+      composeAttachments.push({ filename, path: filePath });
+      existing.add(filePath);
+      added++;
+    }
+    if (added) renderComposeAttachments();
+    return added;
+  }
+
+  function nativeDroppedAttachmentPaths(detail) {
+    let values = [];
+
+    if (Array.isArray(detail)) values = detail;
+    else if (Array.isArray(detail?.files)) values = detail.files;
+    else if (Array.isArray(detail?.paths)) values = detail.paths;
+    else if (detail?.path) values = [detail.path];
+    else if (typeof detail === 'string') values = [detail];
+
+    const paths = [];
+    const seen = new Set();
+
+    for (const value of values) {
+      const raw = typeof value === 'string'
+        ? value
+        : String(value?.path || value?.file || value?.filename || '');
+      const filePath = normalizeComposeAttachmentPath(raw);
+      if (!filePath || seen.has(filePath)) continue;
+      seen.add(filePath);
+      paths.push(filePath);
+    }
+    return paths;
+  }
+
+  function handleNativeFilesDropped(event) {
+    const modal = document.getElementById('compose-modal');
+    if (!modal?.classList.contains('open')) return;
+
+    const paths = nativeDroppedAttachmentPaths(event?.detail);
+    if (!paths.length) {
+      console.warn('[FARO Mail] filesDropped sans chemin exploitable :', event?.detail);
+      status(t('compose.dropUnsupported'), 'error');
+      return;
+    }
+
+    const added = addComposeAttachmentPaths(paths);
+    if (added) reportAddedComposeAttachments(added);
+    else status(t('compose.attachAlreadyAdded'), 'info');
+  }
+
+  function reportAddedComposeAttachments(count) {
+    if (count > 0) status(t('compose.attachAdded', { count }), 'success');
+  }
+
+  function attachFile() {
+    const picker = document.getElementById('compose-file-picker');
+    if (!picker) {
+      status(t('compose.attachPickerMissing'), 'error');
+      return;
+    }
+    picker.value = '';
+    picker.click();
+  }
+
+  async function send() {
+    const button = document.getElementById('btn-send');
+    button.disabled = true;
+    try {
+      const envelope = composeEnvelope();
+      const schedule = document.getElementById('compose-send-later')?.checked === true;
+      if (schedule) {
+        const rawDate = document.getElementById('compose-send-at')?.value || '';
+        const sendAt = new Date(rawDate).getTime();
+        if (!Number.isFinite(sendAt) || sendAt <= Date.now()) {
+          throw new Error(t('scheduled.futureDateRequired'));
+        }
+        const saved = await rpc('scheduled.save', {
+          id: composeScheduledId,
+          accountId: envelope.accountId,
+          mail: envelope.mail,
+          state: composeState(),
+          sendAt,
+          removeDraftId: composeDraftId,
+        });
+        composeScheduledId = saved?.item?.id || null;
+        composeDraftId = null;
+        closeModals();
+        status(`✓ ${t('scheduled.saved')}`, 'success');
+        window.OutboxUI?.refresh?.();
+        return;
+      }
+      const result = await rpc('mail.send', {
+        ...envelope,
+        draftId: composeDraftId,
+        scheduledId: composeScheduledId,
+      });
+      composeDraftId = null;
+      composeScheduledId = null;
+      closeModals();
+      status(result.sentCopyWarning
+        ? t('compose.sentCopyWarning')
+        : '✓ ' + t('compose.sent'), result.sentCopyWarning ? 'error' : 'success');
+      refreshSidebarCounts().catch(() => {});
+      window.OutboxUI?.refresh?.();
+      if (['sent', 'unified', 'account'].includes(view.type)) refresh({ preserveListState: true }).catch(() => {});
+    } catch (error) {
+      alert(`${t('error')} : ${error.message}`);
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  // ---------- Réglages des signatures ----------
+  function populateSignatureAccountSelect() {
+    const select = document.getElementById('set-signature-account');
+    select.innerHTML = accounts.map(account =>
+      `<option value="${esc(account.id)}">${esc(account.displayName || account.email)} — ${esc(account.email)}</option>`).join('');
+    if (config.defaultAccountId && accounts.some(account => account.id === config.defaultAccountId)) {
+      select.value = config.defaultAccountId;
+    }
+    loadSignatureEditor(select.value);
+  }
+
+  function loadSignatureEditor(accountId) {
+    const profile = signatureProfile(accountId);
+    document.getElementById('set-signature-enabled').value = profile.enabled ? '1' : '0';
+    document.getElementById('set-signature-format').value = profile.format;
+    document.getElementById('set-signature-new').value = profile.newMessages ? '1' : '0';
+    document.getElementById('set-signature-replies').value = profile.replies ? '1' : '0';
+    document.getElementById('set-signature-forwards').value = profile.forwards ? '1' : '0';
+    document.getElementById('set-signature-separator').value = profile.separator ? '1' : '0';
+    document.getElementById('set-signature-reply-position').value = profile.replyPosition;
+    document.getElementById('set-signature-forward-position').value = profile.forwardPosition;
+    document.getElementById('set-signature-content').value = profile.content;
+    document.getElementById('signature-settings-status').textContent = '';
+    renderSettingsSignaturePreview();
+  }
+
+  function signatureProfileFromEditor() {
+    return normalizeSignatureProfile({
+      enabled: document.getElementById('set-signature-enabled').value === '1',
+      format: document.getElementById('set-signature-format').value,
+      content: document.getElementById('set-signature-content').value,
+      newMessages: document.getElementById('set-signature-new').value === '1',
+      replies: document.getElementById('set-signature-replies').value === '1',
+      forwards: document.getElementById('set-signature-forwards').value === '1',
+      separator: document.getElementById('set-signature-separator').value === '1',
+      replyPosition: document.getElementById('set-signature-reply-position').value,
+      forwardPosition: document.getElementById('set-signature-forward-position').value,
+    });
+  }
+
+  function renderSettingsSignaturePreview() {
+    const profile = signatureProfileFromEditor();
+    const preview = document.getElementById('settings-signature-preview');
+    preview.classList.toggle('disabled', !profile.enabled);
+    if (!profile.content.trim()) {
+      preview.textContent = t('signature.emptyPreview');
+      preview.classList.add('empty');
+      return;
+    }
+    preview.classList.remove('empty');
+    if (profile.format === 'html') preview.innerHTML = signatureHtml(profile);
+    else preview.textContent = signaturePlainText(profile);
+  }
+
+  async function saveSignatureSettings() {
+    const accountId = document.getElementById('set-signature-account').value;
+    if (!accountId) return;
+    const profile = signatureProfileFromEditor();
+    if (profile.format === 'html') profile.content = sanitizeSignatureHtml(profile.content);
+    const signatureProfiles = { ...(config.signatureProfiles || {}), [accountId]: profile };
+    try {
+      config = await rpc('config.set', { signatureProfiles });
+      document.getElementById('signature-settings-status').textContent = t('signature.saved');
+      status(t('signature.saved'), 'success');
+      renderSettingsSignaturePreview();
+    } catch (error) {
+      document.getElementById('signature-settings-status').textContent = `${t('error')} : ${error.message}`;
+      status(`${t('error')} : ${error.message}`, 'error');
+    }
+  }
+
+  // ---------- Comptes ----------
+  const accountField = id => document.getElementById(id);
+
+  function setAccountStatus(message = '', state = '') {
+    const element = accountField('acc-status');
+    element.textContent = message;
+    element.classList.remove('success', 'error');
+    if (state) element.classList.add(state);
+  }
+
+  function updateAccountLogoPreview(data = '', account = null) {
+    const preview = accountField('acc-logo-preview');
+    if (!preview) return;
+    if (data) {
+      preview.innerHTML = `<img src="${esc(data)}" alt="">`;
+      preview.classList.add('has-image');
+    } else {
+      const sample = account || { displayName: accountField('acc-name')?.value, email: accountField('acc-email')?.value, color: accountField('acc-color')?.value };
+      preview.innerHTML = providerIconForAccount(sample);
+      preview.classList.remove('has-image');
+    }
+  }
+
+  function readAccountLogoFile(file) {
+    return new Promise((resolve, reject) => {
+      if (!file) { resolve(''); return; }
+      if (!/^image\//i.test(file.type || '')) {
+        reject(new Error(t('account.logoInvalid')));
+        return;
+      }
+      if (file.size > 256 * 1024) {
+        reject(new Error(t('account.logoTooLarge')));
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = () => reject(new Error(t('account.logoReadError')));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function updateIncomingProtocolForm() {
+    const protocol = accountField('acc-receive-protocol')?.value === 'pop3' ? 'pop3' : 'imap';
+    accountField('account-imap-section')?.classList.toggle('hidden', protocol !== 'imap');
+    accountField('account-pop3-section')?.classList.toggle('hidden', protocol !== 'pop3');
+    const deletePolicy = accountField('acc-pop3-delete-policy')?.value || 'keep';
+    accountField('acc-pop3-delete-days-field')?.classList.toggle('hidden', protocol !== 'pop3' || deletePolicy !== 'after_days');
+  }
+
+  function resetAccountForm() {
+    editingAccountId = null;
+    accountField('acc-id').value = '';
+    accountField('account-modal-title').textContent = t('account.add');
+    accountField('btn-delete-account').classList.add('hidden');
+    accountField('acc-name').value = '';
+    accountField('acc-email').value = '';
+    accountField('acc-color').value = '#8b7dd8';
+    accountField('acc-receive-protocol').value = 'imap';
+    accountField('acc-logo-data').value = '';
+    updateAccountLogoPreview('');
+    accountField('acc-imap-host').value = '';
+    accountField('acc-imap-port').value = '993';
+    accountField('acc-imap-secure').value = '1';
+    accountField('acc-imap-user').value = '';
+    accountField('acc-imap-pass').value = '';
+    accountField('acc-pop3-host').value = '';
+    accountField('acc-pop3-port').value = '995';
+    accountField('acc-pop3-user').value = '';
+    accountField('acc-pop3-pass').value = '';
+    accountField('acc-pop3-delete-policy').value = 'keep';
+    accountField('acc-pop3-delete-days').value = '7';
+    accountField('acc-smtp-host').value = '';
+    accountField('acc-smtp-port').value = '465';
+    accountField('acc-smtp-secure').value = '1';
+    accountField('acc-smtp-user').value = '';
+    accountField('acc-smtp-pass').value = '';
+    accountField('acc-sync-interval').value = '5';
+    accountField('acc-spam-retention').value = '30';
+    accountField('account-password-hint').textContent = t('account.passwordRequired');
+    document.getElementById('account-folders-section')?.classList.add('hidden');
+    document.getElementById('account-folders-list').innerHTML = '';
+    document.getElementById('account-aliases-section')?.classList.add('hidden');
+    document.getElementById('account-aliases-list').innerHTML = '';
+    updateIncomingProtocolForm();
+    setAccountStatus();
+  }
+
+  // « Envoyer en tant que » : alias partageant les identifiants SMTP du
+  // compte, mais avec un nom/une adresse d'expéditeur différents dans l'en-
+  // tête From. Disponible uniquement une fois le compte créé (comme les
+  // dossiers IMAP supplémentaires), car il est rattaché à son identifiant.
+  function renderAccountAliases(accountId, aliases) {
+    const section = document.getElementById('account-aliases-section');
+    const list = document.getElementById('account-aliases-list');
+    section.classList.remove('hidden');
+    list.innerHTML = '';
+    if (!aliases.length) {
+      list.innerHTML = `<div class="account-folder-empty">${esc(t('account.aliasesEmpty'))}</div>`;
+      return;
+    }
+    for (const alias of aliases) {
+      const row = document.createElement('div');
+      row.className = 'account-alias-row';
+      row.innerHTML = `
+        <span class="account-alias-info">
+          <strong>${esc(alias.name || alias.email)}</strong>
+          <span>&lt;${esc(alias.email)}&gt;</span>
+        </span>
+        <button class="iconbtn" type="button" data-remove-alias="${esc(alias.id)}" title="${esc(t('account.aliasRemove'))}">
+          <i class="fa-solid fa-trash"></i>
+        </button>`;
+      row.querySelector('[data-remove-alias]').onclick = () => removeAccountAlias(accountId, alias.id);
+      list.appendChild(row);
+    }
+  }
+
+  function loadAccountAliases(accountId, details) {
+    renderAccountAliases(accountId, Array.isArray(details.aliases) ? details.aliases : []);
+  }
+
+  async function saveAccountAliases(accountId, aliases) {
+    const account = await rpc('accounts.setAliases', { id: accountId, aliases });
+    const index = accounts.findIndex(item => item.id === account.id);
+    if (index >= 0) accounts[index] = account;
+    renderAccountAliases(accountId, account.aliases || []);
+    return account;
+  }
+
+  async function addAccountAlias() {
+    const accountId = editingAccountId;
+    if (!accountId) return;
+    const name = document.getElementById('alias-new-name').value.trim();
+    const email = document.getElementById('alias-new-email').value.trim();
+    if (!email) {
+      status(t('account.aliasEmailRequired'), 'error');
+      return;
+    }
+    const current = accounts.find(item => item.id === accountId)?.aliases || [];
+    try {
+      await saveAccountAliases(accountId, [...current, { name, email }]);
+      document.getElementById('alias-new-name').value = '';
+      document.getElementById('alias-new-email').value = '';
+      status(t('account.aliasAdded'), 'success');
+    } catch (error) {
+      status(`${t('error')} : ${error.message}`, 'error');
+    }
+  }
+
+  async function removeAccountAlias(accountId, aliasId) {
+    const current = accounts.find(item => item.id === accountId)?.aliases || [];
+    try {
+      await saveAccountAliases(accountId, current.filter(alias => alias.id !== aliasId));
+      status(t('account.aliasRemoved'), 'success');
+    } catch (error) {
+      status(`${t('error')} : ${error.message}`, 'error');
+    }
+  }
+
+  async function loadAccountFolders(accountId, details) {
+    const section = document.getElementById('account-folders-section');
+    const list = document.getElementById('account-folders-list');
+    if (!section || !list || details.receiveProtocol === 'pop3') {
+      section?.classList.add('hidden');
+      return;
+    }
+    section.classList.remove('hidden');
+    list.innerHTML = `<div class="account-folder-empty">${esc(t('account.foldersLoading'))}</div>`;
+    try {
+      const serverFolders = await rpc('accounts.folders', { id: accountId });
+      if (editingAccountId !== accountId) return;
+      const special = new Set([
+        details.folderMap?.inbox, details.folderMap?.sent,
+        details.folderMap?.trash, details.folderMap?.junk,
+      ].filter(Boolean));
+      const selected = new Set(Array.isArray(details.extraFolders) ? details.extraFolders : []);
+      const selectable = (serverFolders || []).filter(folder => folder?.path && !special.has(folder.path));
+      if (!selectable.length) {
+        list.innerHTML = `<div class="account-folder-empty">${esc(t('account.foldersEmpty'))}</div>`;
+        return;
+      }
+      list.innerHTML = '';
+      for (const folder of selectable) {
+        const label = document.createElement('label');
+        label.className = 'account-folder-option';
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = selected.has(folder.path);
+        checkbox.dataset.folderPath = folder.path;
+        const span = document.createElement('span');
+        span.textContent = folder.name || folder.path;
+        checkbox.onchange = () => saveAccountExtraFolders(accountId);
+        label.append(checkbox, span);
+        list.appendChild(label);
+      }
+    } catch (error) {
+      list.innerHTML = `<div class="account-folder-empty">${esc(t('error'))} : ${esc(error.message)}</div>`;
+    }
+  }
+
+  async function saveAccountExtraFolders(accountId) {
+    const list = document.getElementById('account-folders-list');
+    const folders = [...list.querySelectorAll('input[type=checkbox]:checked')].map(input => input.dataset.folderPath);
+    try {
+      const account = await rpc('accounts.setExtraFolders', { id: accountId, folders });
+      const index = accounts.findIndex(item => item.id === account.id);
+      if (index >= 0) accounts[index] = account;
+      renderSidebar();
+      status(t('account.foldersSaved'), 'success');
+    } catch (error) {
+      status(`${t('error')} : ${error.message}`, 'error');
+    }
+  }
+
+  function openNewAccount() {
+    resetAccountForm();
+    openModal('account-modal');
+    accountField('acc-name').focus();
+  }
+
+  async function openAccountEditor(accountId) {
+    resetAccountForm();
+    editingAccountId = accountId;
+    accountField('acc-id').value = accountId;
+    accountField('account-modal-title').textContent = t('account.editTitle');
+    accountField('btn-delete-account').classList.remove('hidden');
+    accountField('account-password-hint').textContent = t('account.passwordHint');
+    openModal('account-modal');
+    setAccountStatus(t('account.loading'));
+    try {
+      const details = await rpc('accounts.getDetails', { id: accountId });
+      if (editingAccountId !== accountId) return;
+      accountField('acc-name').value = details.displayName || '';
+      accountField('acc-email').value = details.email || '';
+      accountField('acc-color').value = safeColor(details.color);
+      accountField('acc-receive-protocol').value = details.receiveProtocol === 'pop3' ? 'pop3' : 'imap';
+      accountField('acc-logo-data').value = details.logoData || '';
+      updateAccountLogoPreview(details.logoData || '', details);
+      accountField('acc-imap-host').value = details.imap?.host || '';
+      accountField('acc-imap-port').value = Number(details.imap?.port) || 993;
+      accountField('acc-imap-secure').value = details.imap?.secure === false ? '0' : '1';
+      accountField('acc-imap-user').value = details.imap?.user || '';
+      accountField('acc-imap-pass').value = '';
+      accountField('acc-pop3-host').value = details.pop3?.host || '';
+      accountField('acc-pop3-port').value = Number(details.pop3?.port) || 995;
+      accountField('acc-pop3-user').value = details.pop3?.user || details.email || '';
+      accountField('acc-pop3-pass').value = '';
+      accountField('acc-pop3-delete-policy').value = details.pop3?.deletePolicy || 'keep';
+      accountField('acc-pop3-delete-days').value = Number(details.pop3?.deleteAfterDays) || 7;
+      accountField('acc-smtp-host').value = details.smtp?.host || '';
+      accountField('acc-smtp-port').value = Number(details.smtp?.port) || 465;
+      accountField('acc-smtp-secure').value = details.smtp?.secure === false ? '0' : '1';
+      accountField('acc-smtp-user').value = details.smtp?.user || details.pop3?.user || details.imap?.user || '';
+      accountField('acc-smtp-pass').value = '';
+      accountField('acc-sync-interval').value = Number(details.syncIntervalMinutes) || 0;
+      accountField('acc-spam-retention').value = Number(details.spamRetentionDays) || 0;
+      updateIncomingProtocolForm();
+      setAccountStatus();
+      accountField('acc-name').focus();
+      loadAccountFolders(accountId, details);
+      loadAccountAliases(accountId, details);
+    } catch (error) {
+      setAccountStatus(`${t('error')} : ${error.message}`, 'error');
+    }
+  }
+
+  function accountPayload() {
+    const value = id => accountField(id).value.trim();
+    return {
+      id: editingAccountId || undefined,
+      displayName: value('acc-name'),
+      email: value('acc-email'),
+      color: accountField('acc-color').value,
+      syncIntervalMinutes: Number(accountField('acc-sync-interval').value) || 0,
+      spamRetentionDays: Number(accountField('acc-spam-retention').value) || 0,
+      logoData: accountField('acc-logo-data')?.value || '',
+      receiveProtocol: accountField('acc-receive-protocol').value === 'pop3' ? 'pop3' : 'imap',
+      imap: {
+        host: value('acc-imap-host'),
+        port: Number(value('acc-imap-port')),
+        secure: accountField('acc-imap-secure').value === '1',
+        user: value('acc-imap-user'),
+        pass: accountField('acc-imap-pass').value,
+      },
+      pop3: {
+        host: value('acc-pop3-host'),
+        port: Number(value('acc-pop3-port')),
+        secure: true,
+        user: value('acc-pop3-user'),
+        pass: accountField('acc-pop3-pass').value,
+        deletePolicy: accountField('acc-pop3-delete-policy').value || 'keep',
+        deleteAfterDays: Number(value('acc-pop3-delete-days')) || 7,
+      },
+      smtp: {
+        host: value('acc-smtp-host'),
+        port: Number(value('acc-smtp-port')),
+        secure: accountField('acc-smtp-secure').value === '1',
+        user: value('acc-smtp-user') || (accountField('acc-receive-protocol').value === 'pop3' ? value('acc-pop3-user') : value('acc-imap-user')),
+        pass: accountField('acc-smtp-pass').value,
+      },
+    };
+  }
+
+  async function saveAccount() {
+    const saveButton = accountField('btn-save-account');
+    saveButton.disabled = true;
+    try {
+      await attemptSaveAccount();
+    } finally {
+      saveButton.disabled = false;
+    }
+  }
+
+  // Tente d'enregistrer le compte ; si le serveur présente un certificat non
+  // reconnu (auto-signé, autorité privée...), propose une confirmation
+  // explicite puis relance l'enregistrement avec l'empreinte acceptée épinglée
+  // pour ce protocole. trustedFingerprints accumule les empreintes déjà
+  // acceptées au fil des relances (ex. IMAP puis SMTP dans le même compte).
+  async function attemptSaveAccount(trustedFingerprints = {}) {
+    setAccountStatus(t('account.testing'));
+    try {
+      const payload = accountPayload();
+      for (const protocol of ['imap', 'pop3', 'smtp']) {
+        if (trustedFingerprints[protocol] && payload[protocol]) {
+          payload[protocol].trustedCertFingerprint = trustedFingerprints[protocol];
+        }
+      }
+      const method = editingAccountId ? 'accounts.update' : 'accounts.add';
+      const account = await rpc(method, payload);
+      const index = accounts.findIndex(item => item.id === account.id);
+      if (index >= 0) accounts[index] = account;
+      else accounts.push(account);
+      if (!config.defaultAccountId) config.defaultAccountId = account.id;
+      if (view.type === 'account' && view.accountId === account.id) {
+        document.getElementById('list-title').textContent = account.email;
+      }
+      renderSidebar();
+      closeModals();
+      setAccountStatus();
+      status(t(editingAccountId ? 'account.updated' : 'account.added'), 'success');
+      const wasNew = !editingAccountId;
+      editingAccountId = null;
+      if (wasNew) rpc('sync.start', { accountId: account.id }).catch(error => status(error.message, 'error'));
+    } catch (error) {
+      if (error.code === 'CERT_UNTRUSTED' && error.certDetails && error.protocol) {
+        setAccountStatus();
+        const trusted = await confirmCertificateTrust(error.protocol, error.certDetails);
+        if (trusted) {
+          await attemptSaveAccount({ ...trustedFingerprints, [error.protocol]: error.certDetails.fingerprint256 });
+          return;
+        }
+        setAccountStatus();
+        return;
+      }
+      setAccountStatus('✗ ' + translateRpcError(error), 'error');
+    }
+  }
+
+  async function deleteEditedAccount() {
+    const accountId = editingAccountId;
+    if (!accountId) return;
+    const account = accounts.find(item => item.id === accountId);
+    const accepted = await confirmAction({
+      title: t('account.removeTitle'),
+      message: t('account.removeConfirm', { account: account?.displayName || account?.email || '' }),
+      confirmLabel: t('account.remove'),
+      icon: 'fa-user-minus',
+      danger: true,
+    });
+    if (!accepted) return;
+    setAccountStatus(t('account.removing'));
+    try {
+      const result = await rpc('accounts.remove', { id: accountId });
+      accounts = Array.isArray(result.accounts) ? result.accounts : accounts.filter(item => item.id !== accountId);
+      config.defaultAccountId = result.defaultAccountId || null;
+      if (view.type === 'account' && view.accountId === accountId) {
+        view = { type: 'unified' };
+        document.getElementById('list-title').textContent = t('unified.inbox');
+        document.querySelectorAll('.side-item').forEach(item => item.classList.remove('active'));
+        document.querySelector('[data-view="unified"]')?.classList.add('active');
+        clearReader();
+      }
+      editingAccountId = null;
+      closeModals();
+      renderSidebar();
+      await refresh();
+      status(t('account.removed'), 'success');
+    } catch (error) {
+      setAccountStatus(`${t('error')} : ${error.message}`, 'error');
+    }
+  }
+
+  // ---------- Contenus distants ----------
+  function remoteTypeIcon(type) {
+    if (type === 'link') return 'fa-solid fa-link';
+    if (type === 'background') return 'fa-solid fa-panorama';
+    if (type === 'stylesheet') return 'fa-solid fa-paintbrush';
+    return 'fa-regular fa-image';
+  }
+
+  function remoteTypeLabel(type) {
+    if (type === 'link') return t('remote.type.link');
+    if (type === 'background') return t('remote.type.background');
+    if (type === 'stylesheet') return t('remote.type.stylesheet');
+    return t('remote.type.image');
+  }
+
+  function remoteOccurrencesLabel(count) {
+    return Number(count) > 1 ? t('remote.occurrences', { count }) : '';
+  }
+
+  function updateRemoteDomainCheckbox(group) {
+    const domainCheckbox = group.querySelector('.remote-domain-checkbox');
+    const resourceChecks = [...group.querySelectorAll('.remote-resource-checkbox:not(:disabled)')];
+    if (!domainCheckbox) return;
+    if (!resourceChecks.length) {
+      domainCheckbox.checked = true;
+      domainCheckbox.indeterminate = false;
+      domainCheckbox.disabled = true;
+      return;
+    }
+    const checked = resourceChecks.filter(input => input.checked).length;
+    domainCheckbox.checked = checked === resourceChecks.length;
+    domainCheckbox.indeterminate = checked > 0 && checked < resourceChecks.length;
+  }
+
+  function updateRemoteDialogState() {
+    const modal = document.getElementById('remote-content-modal');
+    const checks = [...modal.querySelectorAll('.remote-resource-checkbox:not(:disabled)')];
+    const selected = checks.filter(input => input.checked);
+    const button = document.getElementById('btn-display-selected-remote');
+    button.disabled = selected.length === 0;
+    button.querySelector('span').textContent = t('remote.displaySelected', { count: selected.length });
+    modal.querySelectorAll('.remote-domain-group').forEach(updateRemoteDomainCheckbox);
+  }
+
+  function renderRemoteContentDialog(resources) {
+    const listElement = document.getElementById('remote-resource-list');
+    const summaryElement = document.getElementById('remote-summary');
+    listElement.innerHTML = '';
+
+    const totalOccurrences = resources.reduce((sum, resource) => sum + Number(resource.occurrences || 1), 0);
+    const domains = new Set(resources.map(resource => resource.domain).filter(Boolean));
+    const trackers = resources.filter(resource => resource.suspectedTracker)
+      .reduce((sum, resource) => sum + Number(resource.occurrences || 1), 0);
+    const alreadyLoaded = resources.filter(resource => resource.allowed)
+      .reduce((sum, resource) => sum + Number(resource.occurrences || 1), 0);
+
+    summaryElement.innerHTML = `
+      <span class="remote-summary-chip"><i class="fa-regular fa-image"></i>${esc(t('remote.resourceCount', { count: totalOccurrences }))}</span>
+      <span class="remote-summary-chip"><i class="fa-solid fa-globe"></i>${esc(t('remote.domainCount', { count: domains.size }))}</span>
+      ${trackers ? `<span class="remote-summary-chip warning"><i class="fa-solid fa-eye"></i>${esc(t('remote.trackerCount', { count: trackers }))}</span>` : ''}
+      ${alreadyLoaded ? `<span class="remote-summary-chip success"><i class="fa-solid fa-check"></i>${esc(t('remote.loadedCount', { count: alreadyLoaded }))}</span>` : ''}`;
+
+    const grouped = new Map();
+    for (const resource of resources) {
+      const domain = resource.domain || t('remote.unknownDomain');
+      if (!grouped.has(domain)) grouped.set(domain, []);
+      grouped.get(domain).push(resource);
+    }
+
+    [...grouped.entries()].sort(([a], [b]) => a.localeCompare(b, I18N.locale)).forEach(([domain, items]) => {
+      const group = document.createElement('section');
+      group.className = 'remote-domain-group';
+
+      const heading = document.createElement('div');
+      heading.className = 'remote-domain-heading';
+      const domainLabel = document.createElement('label');
+      domainLabel.className = 'remote-domain-select';
+      const domainCheckbox = document.createElement('input');
+      domainCheckbox.type = 'checkbox';
+      domainCheckbox.className = 'remote-domain-checkbox';
+      const domainText = document.createElement('span');
+      domainText.className = 'remote-domain-name';
+      domainText.textContent = domain;
+      domainLabel.append(domainCheckbox, domainText);
+
+      const domainCount = document.createElement('span');
+      domainCount.className = 'remote-domain-count';
+      domainCount.textContent = t('remote.domainResources', {
+        count: items.reduce((sum, item) => sum + Number(item.occurrences || 1), 0),
+      });
+      heading.append(domainLabel, domainCount);
+      const rawDomain = items[0]?.domain || '';
+      if (rawDomain) {
+        const whitelistButton = document.createElement('button');
+        whitelistButton.type = 'button';
+        whitelistButton.className = 'btn compact remote-domain-whitelist-btn';
+        whitelistButton.title = t('settings.remoteWhitelistAdd');
+        whitelistButton.innerHTML = '<i class="fa-solid fa-shield-halved"></i>';
+        whitelistButton.onclick = async () => {
+          const current = Array.isArray(config.remoteContentWhitelist) ? config.remoteContentWhitelist : [];
+          if (!current.includes(rawDomain)) {
+            await applySetting('remoteContentWhitelist', [...current, rawDomain].slice(0, 200));
+            status(t('settings.remoteWhitelistAdded', { domain: rawDomain }), 'success');
+          }
+        };
+        heading.appendChild(whitelistButton);
+      }
+      group.appendChild(heading);
+
+      const rows = document.createElement('div');
+      rows.className = 'remote-resource-rows';
+
+      items.sort((a, b) => Number(b.suspectedTracker) - Number(a.suspectedTracker) || a.url.localeCompare(b.url))
+        .forEach(resource => {
+          const row = document.createElement('label');
+          row.className = 'remote-resource-row';
+          row.classList.toggle('tracker-suspected', Boolean(resource.suspectedTracker));
+          row.classList.toggle('already-loaded', Boolean(resource.allowed));
+
+          const checkbox = document.createElement('input');
+          checkbox.type = 'checkbox';
+          checkbox.className = 'remote-resource-checkbox';
+          checkbox.dataset.remoteUrl = resource.url;
+          checkbox.checked = resource.allowed || !resource.suspectedTracker;
+          checkbox.disabled = Boolean(resource.allowed);
+          checkbox.addEventListener('change', updateRemoteDialogState);
+
+          const icon = document.createElement('span');
+          icon.className = 'remote-resource-icon';
+          icon.innerHTML = `<i class="${remoteTypeIcon(resource.type)}"></i>`;
+
+          const details = document.createElement('span');
+          details.className = 'remote-resource-details';
+          const titleLine = document.createElement('span');
+          titleLine.className = 'remote-resource-title';
+          const title = document.createElement('strong');
+          title.textContent = resource.label || remoteTypeLabel(resource.type);
+          const type = document.createElement('span');
+          type.className = 'remote-resource-type';
+          type.textContent = remoteTypeLabel(resource.type);
+          titleLine.append(title, type);
+
+          if (resource.suspectedTracker) {
+            const tracker = document.createElement('span');
+            tracker.className = 'remote-tracker-badge';
+            tracker.innerHTML = `<i class="fa-solid fa-eye"></i> ${esc(t('remote.trackerSuspected'))}`;
+            titleLine.appendChild(tracker);
+          }
+          if (resource.allowed) {
+            const loaded = document.createElement('span');
+            loaded.className = 'remote-loaded-badge';
+            loaded.innerHTML = `<i class="fa-solid fa-check"></i> ${esc(t('remote.loaded'))}`;
+            titleLine.appendChild(loaded);
+          }
+
+          const url = document.createElement('code');
+          url.className = 'remote-resource-url';
+          url.textContent = resource.url;
+          url.title = resource.url;
+
+          const metadata = document.createElement('span');
+          metadata.className = 'remote-resource-meta';
+          const parts = [];
+          if (resource.width && resource.height) parts.push(`${resource.width} × ${resource.height} px`);
+          const occurrences = remoteOccurrencesLabel(resource.occurrences);
+          if (occurrences) parts.push(occurrences);
+          if (resource.trackerReason === 'dimensions') parts.push(t('remote.trackerReason.dimensions'));
+          if (resource.trackerReason === 'address') parts.push(t('remote.trackerReason.address'));
+          metadata.textContent = parts.join(' · ');
+
+          details.append(titleLine, url);
+          if (metadata.textContent) details.appendChild(metadata);
+          row.append(checkbox, icon, details);
+          rows.appendChild(row);
+        });
+
+      group.appendChild(rows);
+      listElement.appendChild(group);
+
+      domainCheckbox.addEventListener('change', () => {
+        group.querySelectorAll('.remote-resource-checkbox:not(:disabled)').forEach(input => {
+          input.checked = domainCheckbox.checked;
+        });
+        updateRemoteDialogState();
+      });
+    });
+
+    updateRemoteDialogState();
+  }
+
+  function openRemoteContentDialog() {
+    const resources = Viewer.getRemoteResources();
+    if (!resources.length) {
+      status(t('remote.none'));
+      return;
+    }
+    renderRemoteContentDialog(resources);
+    openModal('remote-content-modal');
+  }
+
+  function closeRemoteContentDialog() {
+    document.getElementById('remote-content-modal').classList.remove('open');
+  }
+
+  function persistRemotePermissions(urls) {
+    const messageId = Number(Viewer.current?.meta?.id || 0);
+    if (!messageId || !Array.isArray(urls) || !urls.length) return;
+    rpc('messages.remote.allow', { id: messageId, urls }).catch(error => {
+      status(`${t('error')} : ${error.message}`, 'error');
+    });
+  }
+
+  function displaySelectedRemoteContent() {
+    const selected = [...document.querySelectorAll('#remote-content-modal .remote-resource-checkbox:checked')]
+      .map(input => input.dataset.remoteUrl)
+      .filter(Boolean);
+    if (!selected.length) return;
+    Viewer.allowRemote(selected);
+    persistRemotePermissions(selected);
+    closeRemoteContentDialog();
+  }
+
+  // ---------- Mise à jour et À propos ----------
+  function appVersion() {
+    return String(window.NL_APPVERSION || '0.4.3').replace(/^v/i, '');
+  }
+
+  function compareVersions(a, b) {
+    const left = String(a || '').replace(/^v/i, '').split('.').map(n => Number(n) || 0);
+    const right = String(b || '').replace(/^v/i, '').split('.').map(n => Number(n) || 0);
+    for (let i = 0; i < Math.max(left.length, right.length); i++) {
+      const diff = (left[i] || 0) - (right[i] || 0);
+      if (diff) return diff;
+    }
+    return 0;
+  }
+
+  function setUpdateNotice() {
+    const notice = document.getElementById('update-notice');
+    if (!notice) return;
+    if (updateState.available && updateState.latest) {
+      notice.classList.remove('hidden');
+      notice.querySelector('span').textContent = t('update.notice', { version: updateState.latest });
+      notice.title = t('update.noticeTitle');
+    } else {
+      notice.classList.add('hidden');
+    }
+  }
+
+  function renderUpdateStatus() {
+    const state = document.getElementById('about-update-state');
+    const details = document.getElementById('about-update-details');
+    const button = document.getElementById('btn-check-update');
+    if (button) {
+      button.disabled = updateState.checking;
+      button.classList.toggle('is-checking', updateState.checking);
+    }
+    if (!state || !details) return;
+    if (updateState.checking) {
+      state.innerHTML = `<i class="fa-solid fa-rotate fa-spin"></i><strong>${esc(t('update.checking'))}</strong>`;
+      details.textContent = t('update.checkingDetail');
+    } else if (updateState.available) {
+      state.innerHTML = `<i class="fa-solid fa-circle-up"></i><strong>${esc(t('update.availableTitle', { version: updateState.latest }))}</strong>`;
+      details.textContent = t('update.availableDetail', { current: appVersion(), latest: updateState.latest });
+    } else if (updateState.latest) {
+      state.innerHTML = `<i class="fa-solid fa-circle-check"></i><strong>${esc(t('update.currentTitle'))}</strong>`;
+      details.textContent = t('update.currentDetail', { version: appVersion() });
+    } else if (updateState.error) {
+      state.innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i><strong>${esc(t('update.unavailableTitle'))}</strong>`;
+      details.textContent = updateState.error;
+    } else {
+      state.innerHTML = `<i class="fa-solid fa-circle-info"></i><strong>${esc(t('update.unknownTitle'))}</strong>`;
+      details.textContent = t('update.unknownDetail');
+    }
+  }
+
+  async function fetchLatestReleaseFromBrowser() {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 6000);
+    try {
+      const response = await fetch('https://api.github.com/repos/RayTrunk/faromail/releases/latest', {
+        headers: { Accept: 'application/vnd.github+json' },
+        signal: controller.signal,
+      });
+      if (!response.ok) throw new Error(`GitHub ${response.status}`);
+      const payload = await response.json();
+      return {
+        latest: String(payload.tag_name || payload.name || '').replace(/^v/i, ''),
+        url: payload.html_url || 'https://github.com/RayTrunk/faromail/releases',
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function checkForUpdates(manual = false) {
+    if (updateState.checking) return updateState;
+    if (!manual && updateState.checkedAt && Date.now() - updateState.checkedAt < 6 * 60 * 60 * 1000) return updateState;
+    updateState = { ...updateState, checking: true, error: '' };
+    renderUpdateStatus();
+    if (manual) status(t('update.checking'), 'busy');
+    try {
+      let payload = null;
+      try {
+        await waitForEngine({ timeout: manual ? 8000 : 2500 });
+        payload = await rpc('app.checkLatestVersion');
+      } catch (engineError) {
+        // Sous certains WebView Windows, fetch côté interface est capricieux.
+        // On privilégie donc le moteur Node, puis on garde ce repli pour Linux/dev.
+        payload = await fetchLatestReleaseFromBrowser();
+      }
+      const latest = String(payload?.latest || payload?.tagName || '').replace(/^v/i, '');
+      updateState = {
+        checking: false,
+        latest,
+        url: payload?.url || 'https://github.com/RayTrunk/faromail/releases',
+        available: latest ? compareVersions(latest, appVersion()) > 0 : false,
+        checkedAt: Date.now(),
+        error: '',
+      };
+      if (manual) {
+        status(updateState.available
+          ? t('update.availableTitle', { version: latest })
+          : t('update.currentTitle'), updateState.available ? 'info' : 'success');
+      }
+    } catch (error) {
+      updateState = {
+        ...updateState,
+        checking: false,
+        checkedAt: Date.now(),
+        error: manual ? `${t('update.error')} : ${error.message}` : '',
+      };
+      if (manual && updateState.error) status(updateState.error, 'error');
+    }
+    setUpdateNotice();
+    renderUpdateStatus();
+    return updateState;
+  }
+
+  function openAboutModal() {
+    const version = appVersion();
+    const versionElement = document.getElementById('about-version');
+    if (versionElement) versionElement.textContent = version;
+    renderUpdateStatus();
+    openModal('about-modal');
+    checkForUpdates(false).catch(() => {});
+  }
+
+  function setCleanupProgress({ kind = '', current = 0, total = 0, state = '', error = '', indeterminate = false } = {}) {
+    const root = document.getElementById('cleanup-progress');
+    const labelElement = document.getElementById('cleanup-progress-label');
+    const bar = document.getElementById('cleanup-progress-bar');
+    const countElement = document.getElementById('cleanup-progress-count');
+    if (!root || !labelElement || !bar || !countElement) return;
+    const folder = maintenanceLabel(kind);
+    root.classList.remove('hidden', 'busy', 'success', 'error', 'is-indeterminate');
+    if (state) root.classList.add(state);
+    root.classList.toggle('is-indeterminate', Boolean(indeterminate));
+    const done = Math.max(0, Number(current) || 0);
+    const max = Math.max(0, Number(total) || 0);
+    const percent = max > 0 ? Math.max(0, Math.min(100, Math.round((done / max) * 100))) : 0;
+    labelElement.textContent = error || (state === 'success'
+      ? t('cleanup.done', { folder })
+      : t('cleanup.running', { folder }));
+    countElement.textContent = max > 0 ? `${Math.min(done, max)} / ${max}` : '…';
+    bar.style.width = `${percent}%`;
+    if (state === 'success') setTimeout(() => root.classList.add('hidden'), 2200);
+  }
+
+  // ---------- Sauvegarde et restauration ----------
+  function setBackupOperationStatus(message = '', state = '') {
+    const element = document.getElementById('backup-operation-status');
+    if (!element) return;
+    element.textContent = message;
+    element.classList.remove('busy', 'success', 'error');
+    if (state) element.classList.add(state);
+  }
+
+  function clampBackupPercent(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const number = Number(value);
+    if (!Number.isFinite(number)) return null;
+    return Math.max(0, Math.min(100, Math.round(number)));
+  }
+
+  function setBackupProgress({ label = '', percent = 0, detail = '', state = '', indeterminate = false, visible = true } = {}) {
+    const root = document.getElementById('backup-progress');
+    const bar = document.getElementById('backup-progress-bar');
+    const labelElement = document.getElementById('backup-progress-label');
+    const percentElement = document.getElementById('backup-progress-percent');
+    const detailElement = document.getElementById('backup-progress-detail');
+    if (!root || !bar || !labelElement || !percentElement || !detailElement) return;
+
+    root.classList.toggle('hidden', !visible);
+    root.classList.remove('busy', 'success', 'error', 'is-indeterminate');
+    if (state) root.classList.add(state);
+    root.classList.toggle('is-indeterminate', Boolean(indeterminate));
+
+    const normalized = clampBackupPercent(percent);
+    labelElement.textContent = label || t('backup.progress.waiting');
+    detailElement.textContent = detail || '';
+    percentElement.textContent = indeterminate || normalized === null ? '…' : `${normalized} %`;
+    bar.style.width = `${normalized ?? 0}%`;
+    root.setAttribute('aria-label', labelElement.textContent);
+    if (indeterminate || normalized === null) root.removeAttribute('aria-valuenow');
+    else root.setAttribute('aria-valuenow', String(normalized));
+  }
+
+  function resetBackupProgress({ hide = true } = {}) {
+    setBackupProgress({
+      label: t('backup.progress.waiting'),
+      percent: 0,
+      detail: '',
+      visible: !hide,
+    });
+  }
+
+  function backupPhasePercent(kind, step, completed, total) {
+    const ratio = total > 0 ? Math.max(0, Math.min(1, completed / total)) : 0;
+    if (kind !== 'import') {
+      if (step === 'prepare') return ratio * 8;
+      return 8 + ratio * 92;
+    }
+    const phases = {
+      safety: [0, 40],
+      extract: [40, 85],
+      validate: [85, 92],
+      apply: [92, 98],
+      finalize: [98, 100],
+    };
+    const [start, end] = phases[step] || [0, 100];
+    return start + ratio * (end - start);
+  }
+
+  function updateBackupProgress(data = {}) {
+    const kind = data.kind === 'import' ? 'import' : 'export';
+    const step = String(data.step || (kind === 'import' ? 'extract' : 'archive'));
+    const completed = Math.max(0, Number(data.completed) || 0);
+    const total = Math.max(0, Number(data.total) || 0);
+    const key = `backup.progress.${step}`;
+    const label = t(key, { completed, total });
+    const rawName = String(data.name || '').replace(/\\/g, '/');
+    const currentName = rawName ? rawName.split('/').pop() : '';
+    const detail = currentName
+      ? t('backup.progress.currentFile', { name: currentName })
+      : (total > 1 ? t('backup.progress.fileCount', { completed, total }) : '');
+    const percent = backupPhasePercent(kind, step, completed, total);
+    setBackupProgress({ label, percent, detail, state: 'busy' });
+    setBackupOperationStatus(label, 'busy');
+  }
+
+  function setBackupBusy(value) {
+    backupBusy = Boolean(value);
+    const card = document.querySelector('.backup-settings-card');
+    card?.classList.toggle('is-busy', backupBusy);
+    [
+      'btn-export-backup', 'btn-import-backup', 'backup-password', 'backup-password-confirm',
+      'btn-import-eml', 'eml-import-account', 'eml-import-mode',
+    ].forEach(id => {
+      const control = document.getElementById(id);
+      if (control) control.disabled = backupBusy || (id === 'btn-import-eml' && !accounts.length);
+    });
+  }
+
+  function populateEmlImportAccounts() {
+    const select = document.getElementById('eml-import-account');
+    const button = document.getElementById('btn-import-eml');
+    if (!select) return;
+
+    select.innerHTML = accounts.length
+      ? accounts.map(account =>
+          `<option value="${esc(account.id)}">${esc(account.displayName || account.email)} — ${esc(account.email)}</option>`
+        ).join('')
+      : `<option value="">${esc(t('emlImport.noAccounts'))}</option>`;
+
+    const preferred = config.defaultAccountId && accounts.some(account => account.id === config.defaultAccountId)
+      ? config.defaultAccountId
+      : accounts[0]?.id;
+    if (preferred) select.value = preferred;
+    select.disabled = backupBusy || !accounts.length;
+    if (button) button.disabled = backupBusy || !accounts.length;
+  }
+
+  function backupRecoveryPassword({ confirm = false } = {}) {
+    const password = String(document.getElementById('backup-password')?.value || '');
+    const confirmation = String(document.getElementById('backup-password-confirm')?.value || '');
+    if (password.length < 8) throw new Error(t('backup.recoveryPasswordTooShort'));
+    if (confirm && password !== confirmation) throw new Error(t('backup.recoveryPasswordMismatch'));
+    return password;
+  }
+
+  function backupFilename() {
+    const date = new Date();
+    const pad = value => String(value).padStart(2, '0');
+    return `FaroMail-sauvegarde-${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}_${pad(date.getHours())}-${pad(date.getMinutes())}.zip`;
+  }
+
+  async function selectBackupArchivePath(mode) {
+    const exporting = mode === 'export';
+    const label = t(exporting ? 'backup.selectingExport' : 'backup.selectingImport');
+    setBackupOperationStatus(label, 'busy');
+    setBackupProgress({ label, percent: 0, indeterminate: true, state: 'busy' });
+    const response = await rpc(
+      exporting ? 'backup.selectExportPath' : 'backup.selectImportPath',
+      exporting ? { defaultName: backupFilename() } : {},
+    );
+    return String(response?.path || '').trim();
+  }
+
+  async function exportCompleteBackup() {
+    if (backupBusy) return;
+    resetBackupProgress();
+    setBackupBusy(true);
+    try {
+      setBackupOperationStatus(t('status.connectingEngine'), 'busy');
+      await waitForEngine();
+      let target = await selectBackupArchivePath('export');
+      if (!target) {
+        setBackupOperationStatus('');
+        resetBackupProgress();
+        return;
+      }
+      if (!target.toLowerCase().endsWith('.zip')) target += '.zip';
+      const password = backupRecoveryPassword({ confirm: true });
+
+      setBackupOperationStatus(t('backup.exporting'), 'busy');
+      const result = await rpc('backup.export', { targetPath: target, password });
+      setBackupProgress({
+        label: t('backup.exportComplete'),
+        percent: 100,
+        detail: t('backup.progress.fileCount', {
+          completed: Number(result.fileCount) || 0,
+          total: Number(result.fileCount) || 0,
+        }),
+        state: 'success',
+      });
+      setBackupOperationStatus(t('backup.exported', {
+        path: result.targetPath,
+        size: fmtSize(result.archiveSize),
+      }), 'success');
+      status(t('backup.exported', {
+        path: result.targetPath,
+        size: fmtSize(result.archiveSize),
+      }), 'success');
+    } catch (error) {
+      console.error('[FARO Mail] Export de la sauvegarde :', error);
+      setBackupProgress({ label: t('backup.failed'), percent: null, detail: error.message, state: 'error' });
+      setBackupOperationStatus(`${t('error')} : ${error.message}`, 'error');
+      status(`${t('error')} : ${error.message}`, 'error');
+    } finally {
+      setBackupBusy(false);
+    }
+  }
+
+  async function importCompleteBackup() {
+    if (backupBusy) return;
+    resetBackupProgress();
+    setBackupBusy(true);
+
+    let sourcePath;
+    let inspection;
+    try {
+      setBackupOperationStatus(t('status.connectingEngine'), 'busy');
+      await waitForEngine();
+      sourcePath = await selectBackupArchivePath('import');
+      if (!sourcePath) {
+        setBackupOperationStatus('');
+        resetBackupProgress();
+        setBackupBusy(false);
+        return;
+      }
+      setBackupOperationStatus(t('backup.inspecting'), 'busy');
+      setBackupProgress({ label: t('backup.inspecting'), percent: 0, indeterminate: true, state: 'busy' });
+      inspection = await rpc('backup.inspect', { sourcePath });
+    } catch (error) {
+      console.error('[FARO Mail] Sélection ou vérification de la sauvegarde :', error);
+      setBackupProgress({ label: t('backup.failed'), percent: null, detail: error.message, state: 'error' });
+      setBackupOperationStatus(`${t('error')} : ${error.message}`, 'error');
+      status(`${t('error')} : ${error.message}`, 'error');
+      setBackupBusy(false);
+      return;
+    }
+
+    const manifest = inspection.manifest || {};
+    const summary = manifest.summary || {};
+    let password;
+    try {
+      password = backupRecoveryPassword();
+    } catch (error) {
+      setBackupProgress({ label: t('backup.failed'), percent: null, detail: error.message, state: 'error' });
+      setBackupOperationStatus(`${t('error')} : ${error.message}`, 'error');
+      setBackupBusy(false);
+      return;
+    }
+    const createdAt = manifest.createdAt
+      ? new Date(manifest.createdAt).toLocaleString(I18N.locale || 'de')
+      : '—';
+    const accepted = await confirmAction({
+      title: t('backup.importTitle'),
+      message: t('backup.importConfirm', {
+        date: createdAt,
+        version: manifest.appVersion || '—',
+        accounts: Number(summary.accounts) || 0,
+        messages: Number(summary.messages) || 0,
+      }),
+      confirmLabel: t('backup.importButton'),
+      icon: 'fa-box-archive',
+      danger: true,
+      note: t('backup.importWarning'),
+    });
+    if (!accepted) {
+      setBackupOperationStatus('');
+      resetBackupProgress();
+      setBackupBusy(false);
+      return;
+    }
+
+    setBackupOperationStatus(t('backup.importing'), 'busy');
+    try {
+      const result = await rpc('backup.import', { sourcePath, password });
+      const message = t('backup.imported', {
+        accounts: Number(result.accounts) || 0,
+        messages: Number(result.messages) || 0,
+        path: result.safetyBackupPath || '—',
+      });
+      setBackupProgress({ label: t('backup.importComplete'), percent: 100, detail: '', state: 'success' });
+      setBackupOperationStatus(message, 'success');
+      status(message, 'success');
+      setTimeout(() => window.location.reload(), 1200);
+    } catch (error) {
+      console.error('[FARO Mail] Import de la sauvegarde :', error);
+      setBackupProgress({ label: t('backup.failed'), percent: null, detail: error.message, state: 'error' });
+      setBackupOperationStatus(`${t('error')} : ${error.message}`, 'error');
+      status(`${t('error')} : ${error.message}`, 'error');
+    } finally {
+      setBackupBusy(false);
+    }
+  }
+
+
+  async function importEmlMessages() {
+    if (backupBusy || !accounts.length) return;
+    const accountId = String(document.getElementById('eml-import-account')?.value || '');
+    const mode = String(document.getElementById('eml-import-mode')?.value || 'auto');
+    if (!accountId) {
+      status(t('emlImport.noAccounts'), 'error');
+      return;
+    }
+
+    resetBackupProgress();
+    setBackupBusy(true);
+    try {
+      setBackupOperationStatus(t('status.connectingEngine'), 'busy');
+      await waitForEngine();
+
+      setBackupOperationStatus(t('emlImport.selecting'), 'busy');
+      setBackupProgress({
+        label: t('emlImport.selecting'),
+        percent: 0,
+        indeterminate: true,
+        state: 'busy',
+      });
+
+      const selection = await rpc('eml.selectImportPaths');
+      const paths = Array.isArray(selection?.paths) ? selection.paths : [];
+      if (!paths.length) {
+        setBackupOperationStatus('');
+        resetBackupProgress();
+        return;
+      }
+
+      setBackupOperationStatus(t('emlImport.importing', { count: paths.length }), 'busy');
+      setBackupProgress({
+        label: t('emlImport.importing', { count: paths.length }),
+        percent: 0,
+        detail: '',
+        state: 'busy',
+      });
+
+      const result = await rpc('eml.import', { accountId, paths, mode });
+      const message = t('emlImport.done', {
+        imported: Number(result.imported) || 0,
+        duplicates: Number(result.duplicates) || 0,
+        failed: Number(result.failed) || 0,
+      });
+      const state = Number(result.failed) > 0 ? 'info' : 'success';
+      setBackupProgress({
+        label: t('emlImport.complete'),
+        percent: 100,
+        detail: message,
+        state: Number(result.failed) > 0 ? 'error' : 'success',
+      });
+      setBackupOperationStatus(message, state);
+      status(message, state);
+      await refreshVisibleList({ preserveListState: true });
+      await refreshSidebarCounts();
+    } catch (error) {
+      console.error('[FARO Mail] Import EML :', error);
+      setBackupProgress({
+        label: t('emlImport.failed'),
+        percent: null,
+        detail: error.message,
+        state: 'error',
+      });
+      setBackupOperationStatus(`${t('error')} : ${error.message}`, 'error');
+      status(`${t('error')} : ${error.message}`, 'error');
+    } finally {
+      setBackupBusy(false);
+      populateEmlImportAccounts();
+    }
+  }
+
+
+  // ---------- Règles d'indésirables ----------
+  let spamRuleSettingsCache = { rules: [], senders: [] };
+
+  function spamRuleBadge(action) {
+    return action === 'allow' ? t('spam.ruleAllowed') : t('spam.ruleBlocked');
+  }
+
+  function spamRuleRowsHtml(rules) {
+    if (!rules.length) return `<div class="spam-rule-group-empty">${esc(t('spam.noRulesInGroup'))}</div>`;
+    return rules.map(rule => `
+      <div class="spam-rule-row ${esc(rule.action)}">
+        <span class="spam-rule-main">
+          <strong>${esc(rule.value)}</strong>
+          <small>${esc(spamRuleBadge(rule.action))}</small>
+        </span>
+        <span class="spam-rule-hits">${esc(t('spam.ruleHits', { count: Number(rule.hits || 0) }))}</span>
+        <button class="iconbtn" type="button" data-remove-spam-rule="${esc(rule.id)}" title="${esc(t('delete'))}"><i class="fa-solid fa-trash"></i></button>
+      </div>`).join('');
+  }
+
+  function spamRuleSubgroupHtml(action, kind, rules) {
+    const open = action === 'block' && rules.length ? ' open' : '';
+    const label = kind === 'domain' ? t('spam.rulesDomains') : t('spam.rulesAddresses');
+    return `<details class="spam-rule-subgroup"${open}>
+      <summary><span>${esc(label)}</span><span class="spam-rule-subgroup-count">${rules.length}</span></summary>
+      <div class="spam-rule-subgroup-list">${spamRuleRowsHtml(rules)}</div>
+    </details>`;
+  }
+
+  function renderSpamRuleSettings() {
+    const rulesBox = document.getElementById('spam-rules-list');
+    const sendersBox = document.getElementById('spam-senders-list');
+    if (!rulesBox || !sendersBox) return;
+
+    const searchValue = String(document.getElementById('spam-rule-search')?.value || '').trim().toLowerCase();
+    const allRules = Array.isArray(spamRuleSettingsCache.rules) ? spamRuleSettingsCache.rules : [];
+    const rules = searchValue
+      ? allRules.filter(rule => `${rule.value || ''} ${rule.label || ''} ${rule.notes || ''}`.toLowerCase().includes(searchValue))
+      : allRules;
+    const totalBox = document.getElementById('spam-rule-total');
+    if (totalBox) totalBox.textContent = t('spam.rulesCount', { count: allRules.length });
+
+    const section = action => {
+      const actionRules = rules.filter(rule => rule.action === action);
+      const emailRules = actionRules.filter(rule => rule.kind === 'email');
+      const domainRules = actionRules.filter(rule => rule.kind === 'domain');
+      const allowed = action === 'allow';
+      return `<section class="spam-rule-section ${action}">
+        <div class="spam-rule-section-heading">
+          <span><i class="fa-solid ${allowed ? 'fa-shield' : 'fa-ban'}"></i> ${esc(t(allowed ? 'spam.rulesAllowed' : 'spam.rulesBlocked'))}</span>
+          <span class="spam-rule-section-count">${actionRules.length}</span>
+        </div>
+        ${spamRuleSubgroupHtml(action, 'email', emailRules)}
+        ${spamRuleSubgroupHtml(action, 'domain', domainRules)}
+      </section>`;
+    };
+    rulesBox.innerHTML = section('block') + section('allow');
+
+    rulesBox.querySelectorAll('[data-remove-spam-rule]').forEach(button => {
+      button.onclick = async () => {
+        button.disabled = true;
+        try {
+          await rpc('spam.rules.remove', { id: Number(button.dataset.removeSpamRule) });
+          await refreshSpamRuleSettings();
+          await refreshVisibleList({ preserveListState: true });
+        } catch (error) {
+          status(`${t('error')} : ${error.message}`, 'error');
+        }
+      };
+    });
+
+    const allSenders = Array.isArray(spamRuleSettingsCache.senders) ? spamRuleSettingsCache.senders : [];
+    // Une adresse déjà couverte par une règle d'adresse ou de domaine n'est
+    // plus une suggestion à classer. Les règles restent consultables au-dessus.
+    const senders = allSenders.filter(sender => !sender.email_action && !sender.domain_action);
+    const collectedCount = document.getElementById('spam-collected-count');
+    if (collectedCount) collectedCount.textContent = t('spam.collectedPending', { count: senders.length });
+
+    sendersBox.innerHTML = senders.length ? senders.map(sender => `
+      <div class="spam-sender-row">
+        <span class="spam-sender-main">
+          <strong>${esc(sender.display_name || sender.value)}</strong>
+          <small>${esc(sender.value)}${sender.domain ? ` · ${esc(sender.domain)}` : ''}</small>
+        </span>
+        <span class="spam-sender-counts">${esc(t('spam.senderCounts', { spam: Number(sender.spam || 0), total: Number(sender.total || 0) }))}</span>
+        <span class="spam-sender-actions">
+          <button class="btn compact" type="button" data-rule-action="block" data-rule-kind="email" data-rule-value="${esc(sender.value)}"><i class="fa-solid fa-ban"></i>${esc(t('spam.blockAddress'))}</button>
+          <button class="btn compact" type="button" data-rule-action="block" data-rule-kind="domain" data-rule-value="${esc(sender.domain || '')}" ${sender.domain ? '' : 'disabled'}><i class="fa-solid fa-globe"></i>${esc(t('spam.blockDomain'))}</button>
+          <button class="btn compact" type="button" data-rule-action="allow" data-rule-kind="email" data-rule-value="${esc(sender.value)}"><i class="fa-solid fa-shield"></i>${esc(t('spam.allowAddress'))}</button>
+          <button class="btn compact" type="button" data-rule-action="allow" data-rule-kind="domain" data-rule-value="${esc(sender.domain || '')}" ${sender.domain ? '' : 'disabled'}><i class="fa-solid fa-earth-europe"></i>${esc(t('spam.allowDomain'))}</button>
+        </span>
+      </div>`).join('') : `<div class="empty-hint">${esc(t('spam.noCollected'))}</div>`;
+
+    sendersBox.querySelectorAll('[data-rule-action]').forEach(button => {
+      button.onclick = async () => {
+        const action = String(button.dataset.ruleAction || 'block');
+        const kind = String(button.dataset.ruleKind || 'email');
+        const value = String(button.dataset.ruleValue || '');
+        if (!value) return;
+        sendersBox.querySelectorAll('button').forEach(item => { item.disabled = true; });
+        try {
+          const result = await rpc('spam.rules.save', { action, kind, value });
+          status(t('spam.ruleSaved', { changed: Number(result.changed || 0) }), 'success');
+          await refreshSpamRuleSettings();
+          await refreshVisibleList({ preserveListState: true });
+        } catch (error) {
+          status(`${t('error')} : ${error.message}`, 'error');
+          renderSpamRuleSettings();
+        }
+      };
+    });
+  }
+
+  async function refreshSpamRuleSettings() {
+    const rulesBox = document.getElementById('spam-rules-list');
+    const sendersBox = document.getElementById('spam-senders-list');
+    if (!rulesBox || !sendersBox || !ws || ws.readyState !== WebSocket.OPEN) return;
+    try {
+      const data = await rpc('spam.rules.list');
+      spamRuleSettingsCache = {
+        rules: Array.isArray(data.rules) ? data.rules : [],
+        senders: Array.isArray(data.senders) ? data.senders : [],
+      };
+      renderSpamRuleSettings();
+    } catch (error) {
+      rulesBox.innerHTML = `<div class="error-inline">${esc(error.message)}</div>`;
+    }
+  }
+
+  async function addSpamRuleFromSettings() {
+    const action = document.getElementById('spam-rule-action')?.value || 'block';
+    const kind = document.getElementById('spam-rule-kind')?.value || 'email';
+    const input = document.getElementById('spam-rule-value');
+    const value = input?.value || '';
+    if (!value.trim()) return;
+    try {
+      const result = await rpc('spam.rules.save', { action, kind, value });
+      if (input) input.value = '';
+      status(t('spam.ruleSaved', { changed: Number(result.changed || 0) }), 'success');
+      await refreshSpamRuleSettings();
+      await refreshVisibleList({ preserveListState: true });
+    } catch (error) {
+      status(`${t('error')} : ${error.message}`, 'error');
+    }
+  }
+
+  // ---------- Paramètres ----------
+  function openSettings() {
+    document.getElementById('set-theme').value = config.theme || 'dark';
+    document.getElementById('set-locale').value = config.locale || 'de';
+    document.getElementById('set-layout').value = config.layout || 'vertical';
+    document.getElementById('set-blockremote').value = config.blockRemoteImages === false ? '0' : '1';
+    document.getElementById('set-conversations').value = config.conversationView === false ? '0' : '1';
+    document.getElementById('set-newmail-notify').value = config.newMailNotifications === false ? '0' : '1';
+    document.getElementById('set-auto-read').value = config.autoMarkRead === false ? '0' : '1';
+    document.getElementById('set-read-delay').value = Math.max(0, Number(config.markReadDelaySeconds) || 0);
+    document.getElementById('set-group-date').value = config.groupByDate === false ? '0' : '1';
+    syncAccentControls();
+    renderRemoteWhitelist();
+
+    const defaultAccount = document.getElementById('set-default-account');
+    defaultAccount.innerHTML = accounts.map(account =>
+      `<option value="${esc(account.id)}" ${account.id === config.defaultAccountId ? 'selected' : ''}>${esc(account.email)}</option>`).join('');
+    populateSignatureAccountSelect();
+    populateEmlImportAccounts();
+
+    const syncList = document.getElementById('sync-account-list');
+    syncList.innerHTML = accounts.length ? accounts.map(account => `
+      <div class="sync-account-row">
+        <span class="account-dot" style="background:${safeColor(account.color)}"></span>
+        <span class="sync-account-name">${esc(account.displayName || account.email)}<small>${esc(account.email)}</small></span>
+        <label>${esc(t('settings.syncEvery'))}</label>
+        <input class="sync-minutes" type="number" min="0" max="1440" step="1"
+               data-account-sync="${esc(account.id)}" value="${Number(account.syncIntervalMinutes) || 0}">
+        <span>${esc(t('settings.minutes'))}</span>
+      </div>`).join('') : `<div class="empty-hint">${esc(t('settings.noAccounts'))}</div>`;
+
+    syncList.querySelectorAll('[data-account-sync]').forEach(input => {
+      input.onchange = async event => {
+        const id = event.currentTarget.dataset.accountSync;
+        const minutes = Math.max(0, Math.min(1440, Math.round(Number(event.currentTarget.value) || 0)));
+        event.currentTarget.value = minutes;
+        try {
+          const updated = await rpc('accounts.setSyncInterval', { id, minutes });
+          const index = accounts.findIndex(account => account.id === id);
+          if (index >= 0) accounts[index] = updated;
+          status(t('settings.syncSaved', { minutes }));
+        } catch (error) {
+          status(`${t('error')} : ${error.message}`, 'error');
+        }
+      };
+    });
+
+    const retentionList = document.getElementById('spam-retention-account-list');
+    retentionList.innerHTML = accounts.length ? accounts.map(account => `
+      <div class="sync-account-row retention-account-row">
+        <span class="account-dot" style="background:${safeColor(account.color)}"></span>
+        <span class="sync-account-name">${esc(account.displayName || account.email)}<small>${esc(account.email)}</small></span>
+        <label>${esc(t('settings.keepSpamFor'))}</label>
+        <input class="sync-minutes" type="number" min="0" max="3650" step="1"
+               data-account-retention="${esc(account.id)}" value="${Number(account.spamRetentionDays) || 0}">
+        <span>${esc(t('settings.days'))}</span>
+      </div>`).join('') : `<div class="empty-hint">${esc(t('settings.noAccounts'))}</div>`;
+
+    retentionList.querySelectorAll('[data-account-retention]').forEach(input => {
+      input.onchange = async event => {
+        const id = event.currentTarget.dataset.accountRetention;
+        const days = Math.max(0, Math.min(3650, Math.round(Number(event.currentTarget.value) || 0)));
+        event.currentTarget.value = days;
+        try {
+          const updated = await rpc('accounts.setSpamRetention', { id, days });
+          const index = accounts.findIndex(account => account.id === id);
+          if (index >= 0) accounts[index] = updated;
+          status(t('settings.retentionSaved', { days }), 'success');
+        } catch (error) {
+          status(`${t('error')} : ${error.message}`, 'error');
+        }
+      };
+    });
+    openModal('settings-modal');
+    refreshSpamRuleSettings().catch(error => status(error.message, 'error'));
+  }
+
+  function renderRemoteWhitelist() {
+    const list = document.getElementById('remote-whitelist-list');
+    if (!list) return;
+    const domains = Array.isArray(config.remoteContentWhitelist) ? config.remoteContentWhitelist : [];
+    if (!domains.length) {
+      list.innerHTML = `<div class="account-folder-empty">${esc(t('settings.remoteWhitelistEmpty'))}</div>`;
+      return;
+    }
+    list.innerHTML = '';
+    for (const domain of domains) {
+      const row = document.createElement('div');
+      row.className = 'remote-whitelist-row';
+      const span = document.createElement('span');
+      span.textContent = domain;
+      const removeButton = document.createElement('button');
+      removeButton.type = 'button';
+      removeButton.title = t('cancel');
+      removeButton.innerHTML = '<i class="fa-solid fa-xmark"></i>';
+      removeButton.onclick = () => removeRemoteWhitelistDomain(domain);
+      row.append(span, removeButton);
+      list.appendChild(row);
+    }
+  }
+
+  async function addRemoteWhitelistDomain() {
+    const input = document.getElementById('remote-whitelist-input');
+    const raw = String(input?.value || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+    if (!raw) return;
+    const current = Array.isArray(config.remoteContentWhitelist) ? config.remoteContentWhitelist : [];
+    if (current.includes(raw)) { input.value = ''; return; }
+    const next = [...current, raw].slice(0, 200);
+    await applySetting('remoteContentWhitelist', next);
+    input.value = '';
+    renderRemoteWhitelist();
+    status(t('settings.remoteWhitelistAdded', { domain: raw }), 'success');
+  }
+
+  async function removeRemoteWhitelistDomain(domain) {
+    const current = Array.isArray(config.remoteContentWhitelist) ? config.remoteContentWhitelist : [];
+    const next = current.filter(item => item !== domain);
+    await applySetting('remoteContentWhitelist', next);
+    renderRemoteWhitelist();
+  }
+
+  async function applySetting(key, value) {
+    config = await rpc('config.set', { [key]: value });
+    if (key === 'theme') {
+      document.documentElement.dataset.theme = value;
+      applyAccentScheme();
+      syncAccentControls();
+    }
+    if (key === 'accentColor') {
+      applyAccentScheme();
+      syncAccentControls();
+      status(t('settings.accentSaved'), 'success');
+    }
+    if (key === 'layout') {
+      document.getElementById('app').dataset.layout = value;
+      applyPaneDimensions();
+    }
+    if (key === 'locale') {
+      await I18N.load(value);
+      applyAppVersion();
+      applySidebarSectionStates();
+      renderSidebar();
+      syncListControls();
+      list.render(true);
+    }
+    if (key === 'defaultAccountId') {
+      await rpc('accounts.setDefault', { id: value });
+      renderSidebar();
+    }
+    if (key === 'conversationView' || key === 'groupByDate') {
+      clearReader();
+      syncListControls();
+      await refresh();
+    }
+    if (key === 'autoMarkRead' || key === 'markReadDelaySeconds') clearReadTimer();
+  }
+
+  function syncListControls() {
+    const sort = document.getElementById('list-sort');
+    const direction = document.getElementById('list-sort-direction');
+    const grouping = document.getElementById('btn-date-groups');
+    if (!sort || !direction || !grouping) return;
+    sort.value = config.sortBy || 'date';
+    const ascending = (config.sortDirection || 'desc') === 'asc';
+    direction.querySelector('i').className = ascending
+      ? 'fa-solid fa-arrow-up-short-wide'
+      : 'fa-solid fa-arrow-down-wide-short';
+    direction.title = t(ascending ? 'sort.ascending' : 'sort.descending');
+    const groupActive = config.groupByDate !== false && (config.sortBy || 'date') === 'date';
+    grouping.classList.toggle('active', groupActive);
+    grouping.disabled = (config.sortBy || 'date') !== 'date';
+    grouping.title = t(groupActive ? 'group.disable' : 'group.enable');
+  }
+
+  async function applyListPreference(key, value) {
+    config = await rpc('config.set', { [key]: value });
+    syncListControls();
+    clearReader();
+    await refresh();
+  }
+
+  // ---------- Fermeture ----------
+  function openQuitDialog() {
+    if (shuttingDown) return;
+    const activeCount = activeSyncActivities.size + activeMaintenanceActivities.size;
+    const warning = document.getElementById('quit-sync-warning');
+    const warningText = document.getElementById('quit-sync-warning-text');
+    warning.classList.toggle('hidden', activeCount === 0);
+    warningText.textContent = activeCount
+      ? t('quit.syncActive', { count: activeCount })
+      : '';
+    openModal('quit-modal');
+  }
+
+  async function shutdownEngineAndExit() {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    closeModals();
+    toggleActivityPanel(false);
+    status(t('status.shuttingDown'), 'busy');
+
+    const forceExit = () => {
+      try { Neutralino?.app?.exit?.(0)?.catch?.(() => {}); } catch {}
+      setTimeout(() => {
+        try { Neutralino?.app?.killProcess?.()?.catch?.(() => {}); } catch {}
+      }, 500);
+      setTimeout(() => {
+        try { window.close(); } catch {}
+      }, 900);
+    };
+
+    const mayShutdownEngine = !usesBundledWindowsEngine() || bundledEngineOwned;
+    try {
+      if (mayShutdownEngine && ws?.readyState === WebSocket.OPEN) {
+        await Promise.race([
+          rpc('app.shutdown'),
+          new Promise(resolve => setTimeout(resolve, 650)),
+        ]);
+      }
+    } catch {}
+
+    // Le moteur Windows embarqué se ferme normalement via app.shutdown. Si la
+    // fermeture gracieuse n'a pas abouti, Neutralino termine le processus fils.
+    if (usesBundledWindowsEngine() && bundledEngineOwned) {
+      await new Promise(resolve => setTimeout(resolve, 250));
+      await stopBundledWindowsEngine();
+    }
+
+    // Ne pas attendre indéfiniment Neutralino.app.exit() : sur certaines plateformes,
+    // le moteur est bien arrêté mais la fenêtre reste vivante. On déclenche donc
+    // la sortie native, puis un killProcess de secours. Charmant, mais efficace.
+    forceExit();
+  }
+
+  // ---------- Utilitaires ----------
+  const openModal = id => document.getElementById(id).classList.add('open');
+  const closeModals = () => {
+    document.querySelectorAll('.modal-veil').forEach(modal => modal.classList.remove('open'));
+    if (pendingConfirmAction) {
+      const resolve = pendingConfirmAction;
+      pendingConfirmAction = null;
+      resolve(false);
+    }
+  };
+  const status = (text, state = 'info') => {
+    const bar = document.getElementById('statusbar');
+    const textElement = document.getElementById('status-text');
+    const icon = document.getElementById('status-icon');
+    if (!bar || !textElement || !icon) return;
+    bar.dataset.status = state;
+    textElement.textContent = text;
+    textElement.title = text;
+    icon.className = state === 'busy'
+      ? 'fa-solid fa-rotate fa-spin'
+      : state === 'success'
+        ? 'fa-solid fa-circle-check'
+        : state === 'error'
+          ? 'fa-solid fa-triangle-exclamation'
+          : 'fa-solid fa-circle-info';
+  };
+  function isEditableTarget(target) {
+    if (!target) return false;
+    const tag = target.tagName;
+    return Boolean(target.isContentEditable) || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+  }
+
+  function openMailShortcutsModal() {
+    openModal('shortcuts-modal');
+  }
+
+  const setEngine = connected => {
+    document.getElementById('engine-dot').classList.toggle('on', connected);
+    if (!I18N.locale) return;
+    if (!connected) status(t('status.disconnected'), 'error');
+    else if (activeSyncActivities.size === 0) status(t('status.connected'), 'success');
+  };
+
+  // Notification discrète en haut à droite de la fenêtre, avec action
+  // optionnelle (ex. « Annuler »). Reste dans la fenêtre de l'application :
+  // aucune notification système qui pourrait apparaître par-dessus un autre
+  // logiciel (caisse, etc.) pendant que FARO Mail tourne en arrière-plan.
+  function showToast({ icon = 'fa-circle-info', title = '', message = '', actionLabel = '', onAction = null, duration = 6000 } = {}) {
+    const stack = document.getElementById('toast-stack');
+    if (!stack) return null;
+    const toast = document.createElement('div');
+    toast.className = 'toast';
+    toast.innerHTML = `
+      <i class="fa-solid ${icon}"></i>
+      <div class="toast-body">
+        ${title ? `<span class="toast-title">${esc(title)}</span>` : ''}
+        ${message ? `<span class="toast-message">${esc(message)}</span>` : ''}
+        ${actionLabel ? `<button class="toast-action" type="button">${esc(actionLabel)}</button>` : ''}
+      </div>
+      <button class="toast-close" type="button" aria-label="${esc(t('close'))}"><i class="fa-solid fa-xmark"></i></button>`;
+    let timer = null;
+    const dismiss = () => {
+      toast.classList.add('toast-leaving');
+      setTimeout(() => toast.remove(), 200);
+    };
+    const schedule = () => { timer = setTimeout(dismiss, duration); };
+    const cancelSchedule = () => { if (timer) clearTimeout(timer); };
+    toast.addEventListener('mouseenter', cancelSchedule);
+    toast.addEventListener('mouseleave', schedule);
+    toast.querySelector('.toast-close').onclick = () => { cancelSchedule(); dismiss(); };
+    if (actionLabel && onAction) {
+      toast.querySelector('.toast-action').onclick = () => { cancelSchedule(); dismiss(); onAction(); };
+    }
+    stack.appendChild(toast);
+    schedule();
+    return { dismiss };
+  }
+
+  function normalizeExternalUrl(value) {
+    let raw = String(value || '').trim().replace(/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g, '');
+    if (!raw) return '';
+    if (raw.startsWith('//')) raw = `https:${raw}`;
+    else if (/^www\./i.test(raw)) raw = `https://${raw}`;
+
+    try {
+      const parsed = new URL(raw);
+      const protocol = parsed.protocol.toLowerCase();
+      if (!['http:', 'https:', 'mailto:'].includes(protocol)) return '';
+      if ((protocol === 'http:' || protocol === 'https:') && !parsed.hostname) return '';
+      return parsed.href;
+    } catch {
+      return '';
+    }
+  }
+
+  function externalLinkDetails(url, displayText = '') {
+    const parsed = new URL(url);
+    const protocol = parsed.protocol.replace(':', '').toUpperCase();
+    const shown = String(displayText || '').replace(/\s+/g, ' ').trim().slice(0, 500);
+    const shownCandidate = shown.match(/(?:https?:\/\/|www\.)[^\s<>"']+/i)?.[0]
+      ?.replace(/[),.;!?]+$/g, '') || '';
+    const shownUrl = normalizeExternalUrl(shownCandidate);
+    let shownHost = '';
+    let realHost = '';
+    let mismatch = false;
+
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+      realHost = parsed.hostname || '';
+      if (shownUrl) {
+        try {
+          const displayed = new URL(shownUrl);
+          if (displayed.protocol === 'http:' || displayed.protocol === 'https:') {
+            shownHost = displayed.hostname || '';
+            const canonicalHost = host => String(host || '').toLowerCase().replace(/^www\./, '');
+            mismatch = Boolean(shownHost && realHost && canonicalHost(shownHost) !== canonicalHost(realHost));
+          }
+        } catch {}
+      }
+    }
+
+    const insecure = parsed.protocol === 'http:';
+    const credentials = Boolean(parsed.username || parsed.password);
+    const suspicious = mismatch || insecure || credentials;
+    let warning = '';
+    if (mismatch) warning = t('link.mismatchWarning', { shown: shownHost, real: realHost });
+    else if (credentials) warning = t('link.credentialsWarning');
+    else if (insecure) warning = t('link.httpWarning');
+
+    return {
+      kind: 'link',
+      url,
+      domain: realHost || (parsed.protocol === 'mailto:' ? parsed.pathname : ''),
+      protocol,
+      displayText: shown,
+      suspicious,
+      warning,
+    };
+  }
+
+  function previewExternalTarget(value) {
+    const raw = String(value || '').trim();
+    const normalized = normalizeExternalUrl(raw);
+    const statusMessage = document.getElementById('status-message');
+    const targetStatus = document.getElementById('link-target-status');
+    const targetText = document.getElementById('link-target-text');
+    if (!statusMessage || !targetStatus || !targetText) return;
+    const displayed = normalized || raw || t('link.invalid');
+    targetText.textContent = t('link.statusTarget', { url: displayed });
+    targetText.title = displayed;
+    statusMessage.classList.add('hidden');
+    targetStatus.classList.remove('hidden');
+  }
+
+  function clearExternalTarget() {
+    const statusMessage = document.getElementById('status-message');
+    const targetStatus = document.getElementById('link-target-status');
+    if (!statusMessage || !targetStatus) return;
+    targetStatus.classList.add('hidden');
+    statusMessage.classList.remove('hidden');
+  }
+
+  async function openExternal(value, { displayText = '' } = {}) {
+    const url = normalizeExternalUrl(value);
+    clearExternalTarget();
+    if (!url) {
+      status(t('link.blockedInvalid'), 'error');
+      return false;
+    }
+    if (externalLinkOpening) return false;
+    externalLinkOpening = true;
+    try {
+      const details = externalLinkDetails(url, displayText);
+      const accepted = await confirmAction({
+        title: t('link.confirmTitle'),
+        message: t('link.confirmMessage'),
+        confirmLabel: t('link.open'),
+        icon: 'fa-arrow-up-right-from-square',
+        danger: false,
+        note: t('link.securityNote'),
+        details,
+      });
+      if (!accepted) return false;
+      try {
+        await rpc('app.openExternal', { url });
+      } catch (engineError) {
+        // Repli utile en mode développement ou avec un moteur plus ancien.
+        await Neutralino.os.open(url);
+      }
+      status(t('link.opened', { destination: details.domain || url }), 'success');
+      return true;
+    } catch (error) {
+      status(t('link.openFailed', { error: error?.message || String(error) }), 'error');
+      return false;
+    } finally {
+      externalLinkOpening = false;
+    }
+  }
+
+  function fmtSize(number) {
+    const size = Number(number) || 0;
+    if (size >= 1073741824) return (size / 1073741824).toFixed(1) + ' Go';
+    if (size >= 1048576) return (size / 1048576).toFixed(1) + ' Mo';
+    if (size >= 1024) return Math.round(size / 1024) + ' Ko';
+    return size + ' o';
+  }
+
+  function fmtDateTime(timestamp) {
+    const date = new Date(Number(timestamp));
+    return Number.isNaN(date.getTime()) ? '' : date.toLocaleString(I18N.locale, {
+      day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit',
+    });
+  }
+
+  function formatPeriod(oldest, newest) {
+    if (!oldest || !newest) return t('stats.noData');
+    const first = new Date(Number(oldest)).toLocaleDateString(I18N.locale);
+    const last = new Date(Number(newest)).toLocaleDateString(I18N.locale);
+    return `${first} → ${last}`;
+  }
+
+  const numberFormat = number => new Intl.NumberFormat(I18N.locale).format(Number(number) || 0);
+  const safeColor = value => /^#[0-9a-f]{3,8}$/i.test(value || '') ? value : '#8b7dd8';
+  const cssEscape = value => window.CSS?.escape ? CSS.escape(value) : String(value).replace(/["\\]/g, '\\$&');
+
+  function defaultAccentForTheme(theme = document.documentElement.dataset.theme || config.theme || 'dark') {
+    return DEFAULT_ACCENTS[theme] || DEFAULT_ACCENTS.dark;
+  }
+
+  function normalizeHexColor(value, fallback = defaultAccentForTheme()) {
+    let color = String(value || '').trim();
+    if (!color) return fallback;
+    if (!color.startsWith('#')) color = `#${color}`;
+    if (/^#[0-9a-f]{3}$/i.test(color)) color = '#' + color.slice(1).split('').map(char => char + char).join('');
+    if (!/^#[0-9a-f]{6}$/i.test(color)) return fallback;
+    return color.toUpperCase();
+  }
+
+  function hexToRgb(color) {
+    const normalized = normalizeHexColor(color);
+    return {
+      r: parseInt(normalized.slice(1, 3), 16),
+      g: parseInt(normalized.slice(3, 5), 16),
+      b: parseInt(normalized.slice(5, 7), 16),
+    };
+  }
+
+  function rgbaFromHex(color, alpha) {
+    const { r, g, b } = hexToRgb(color);
+    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+  }
+
+  function accentForeground(color) {
+    const { r, g, b } = hexToRgb(color);
+    const luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+    return luminance > 0.58 ? '#1A1408' : '#FFFFFF';
+  }
+
+  function accentPresetId(color) {
+    const normalized = normalizeHexColor(color);
+    return ACCENT_PRESETS.find(preset => normalizeHexColor(preset.color) === normalized)?.id || 'custom';
+  }
+
+  function applyAccentScheme() {
+    const accent = normalizeHexColor(config.accentColor || defaultAccentForTheme(config.theme));
+    const root = document.documentElement;
+    root.style.setProperty('--accent', accent);
+    const lightBackground = root.dataset.theme === 'light' || root.dataset.theme === 'sagasser';
+    root.style.setProperty('--accent-soft', rgbaFromHex(accent, lightBackground ? 0.12 : 0.14));
+    root.style.setProperty('--accent-fg', accentForeground(accent));
+  }
+
+  function syncAccentControls(colorValue = config.accentColor || defaultAccentForTheme(config.theme)) {
+    const color = normalizeHexColor(colorValue);
+    const preset = accentPresetId(color);
+    const presetSelect = document.getElementById('set-accent-preset');
+    const picker = document.getElementById('set-accent-color');
+    const hex = document.getElementById('set-accent-hex');
+    const preview = document.getElementById('accent-preview-chip');
+    if (presetSelect) presetSelect.value = preset;
+    if (picker) picker.value = color;
+    if (hex) hex.value = color;
+    if (preview) {
+      preview.style.background = color;
+      preview.style.color = accentForeground(color);
+      preview.style.borderColor = rgbaFromHex(color, 0.32);
+    }
+    document.querySelectorAll('.accent-swatch').forEach(button => {
+      button.classList.toggle('active', normalizeHexColor(button.dataset.color, color) === color);
+    });
+  }
+
+  function colorFrom(value) {
+    let hue = 0;
+    for (const char of String(value || '')) hue = (hue * 31 + char.codePointAt(0)) % 360;
+    return `hsl(${hue} 42% 46%)`;
+  }
+
+  function esc(value) {
+    return String(value || '').replace(/[&<>"]/g, character => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;',
+    }[character]));
+  }
+
+  // ---------- Câblage ----------
+  function wire() {
+    list = new VirtualMailList(document.getElementById('mail-list'), {
+      onOpen: row => openListItem(row).catch(error => {
+        console.error('[FARO Mail] Lecture du message :', error);
+        status(`${t('error')} : ${error.message}`, 'error');
+      }),
+      onOpenTab: row => openItemInTab(row).catch(error => {
+        console.error('[FARO Mail] Ouverture de l’onglet :', error);
+        status(`${t('error')} : ${error.message}`, 'error');
+      }),
+      onQuickAction: quickAction,
+      onSelectionChange: updateBulkSelection,
+    });
+
+    document.getElementById('sidebar').addEventListener('click', event => {
+      const item = event.target.closest('[data-view]');
+      if (!item) return;
+      document.querySelectorAll('.side-item').forEach(button => button.classList.remove('active'));
+      item.classList.add('active');
+      const selected = item.dataset.view;
+      closeQuickLabelMenu();
+      view = selected.startsWith('account:')
+        ? { type: 'account', accountId: selected.slice(8) }
+        : { type: selected };
+      const titles = {
+        unified: t('unified.inbox'),
+        sent: t('sent.folder'),
+        spam: t('spam.folder'),
+        trash: t('trash.folder'),
+      };
+      document.getElementById('list-title').textContent = titles[selected]
+        || accounts.find(account => account.id === view.accountId)?.email || '';
+      updateFolderActionButton();
+      clearReader();
+      refresh();
+    });
+
+    document.getElementById('btn-compose').onclick = () => openCompose(null, 'new');
+    document.getElementById('btn-sync').onclick = () => runManualSync(null);
+    document.getElementById('btn-sync-menu').onclick = toggleSyncMenu;
+    document.addEventListener('click', event => {
+      if (!event.target.closest('#sync-split')) closeSyncMenu();
+    });
+    document.getElementById('btn-select-all').onclick = () => list.selectAll();
+    document.getElementById('btn-clear-selection').onclick = () => list.clearSelection();
+    document.getElementById('btn-bulk-read').onclick = () => runBulkFlag('seen', true);
+    document.getElementById('btn-bulk-unread').onclick = () => runBulkFlag('seen', false);
+    document.getElementById('btn-bulk-flag').onclick = event =>
+      runBulkFlag('flagged', event.currentTarget.dataset.value !== '0');
+    document.getElementById('btn-bulk-label').onclick = toggleBulkLabelMenu;
+    document.getElementById('btn-bulk-spam').onclick = runBulkSpam;
+    document.getElementById('btn-bulk-restore').onclick = runBulkRestore;
+    document.getElementById('btn-bulk-delete').onclick = runBulkDelete;
+    document.getElementById('btn-empty-folder').onclick = emptyCurrentFolder;
+    document.getElementById('btn-confirm-action').onclick = () => resolveConfirmAction(true);
+    document.getElementById('btn-cancel-confirm-action').onclick = () => resolveConfirmAction(false);
+    document.getElementById('btn-close-confirm-action').onclick = () => resolveConfirmAction(false);
+    document.getElementById('btn-contacts').onclick = () => openContacts();
+    document.getElementById('btn-stats').onclick = openStatistics;
+    document.getElementById('btn-exit').onclick = openQuitDialog;
+    document.getElementById('btn-confirm-exit').onclick = shutdownEngineAndExit;
+    document.getElementById('btn-send').onclick = send;
+    document.getElementById('btn-attach').onclick = attachFile;
+    document.getElementById('compose-file-picker')?.addEventListener('change', async event => {
+      const input = event.currentTarget;
+      try {
+        await importComposeAttachmentFiles(input.files);
+      } catch (error) {
+        status(`${t('error')} : ${error.message}`, 'error');
+      } finally {
+        input.value = '';
+      }
+    });
+    const composeEditor = composeEditorElement();
+    ['mouseup', 'keyup', 'focus'].forEach(eventName => {
+      composeEditor?.addEventListener(eventName, rememberComposeSelection);
+    });
+    composeEditor?.addEventListener('pointerdown', ensureComposeEditorInsertionPoint);
+    composeEditor?.addEventListener('input', () => {
+      maintainComposeEditorInsertionPoint();
+      rememberComposeSelection();
+    });
+    composeEditor?.addEventListener('keydown', preserveComposeEditingShortcuts);
+    document.querySelector('.compose-editor-resize-shell')?.addEventListener('click', event => {
+      if (event.target === event.currentTarget) focusComposeEditorAtStart({ scroll: false });
+    });
+    // La citation reste séparée du corps principal mais devient éditable :
+    // les coupes, corrections et copier/coller sont répercutés dans le message envoyé.
+    const composeQuote = document.getElementById('compose-quote-content');
+    composeQuote?.addEventListener('input', syncComposeQuoteText);
+    composeQuote?.addEventListener('blur', syncComposeQuoteText);
+    composeQuote?.addEventListener('keydown', preserveComposeEditingShortcuts);
+
+    // FARO Mail 0.4.3 — drag & drop natif Neutralino
+    // Le dépôt de fichiers est géré par l'événement natif "filesDropped".
+    // modes.window.emitDropEvents=true désactive le comportement natif du
+    // WebView (ouverture d'un PDF, insertion d'un file://, etc.).
+
+    document.querySelectorAll('[data-compose-command]').forEach(button => {
+      button.addEventListener('mousedown', event => {
+        rememberComposeSelection();
+        event.preventDefault();
+      });
+      button.addEventListener('click', () => {
+        if (button.dataset.composeCommand === 'removeFormat') clearComposeFormatting();
+        else runComposeFormatCommand(button.dataset.composeCommand);
+      });
+    });
+    document.getElementById('btn-compose-link')?.addEventListener('mousedown', event => {
+      rememberComposeSelection();
+      event.preventDefault();
+    });
+    document.getElementById('btn-compose-link')?.addEventListener('click', addComposeLink);
+    document.getElementById('btn-compose-emoji')?.addEventListener('mousedown', event => {
+      rememberComposeSelection();
+      event.preventDefault();
+    });
+    document.getElementById('btn-compose-emoji')?.addEventListener('click', toggleComposeEmojiPicker);
+    document.querySelectorAll('[data-compose-emoji]').forEach(button => {
+      button.addEventListener('mousedown', event => event.preventDefault());
+      button.addEventListener('click', () => insertComposeEmoji(button.dataset.composeEmoji));
+    });
+    document.querySelectorAll('[data-compose-contact-target]').forEach(button => {
+      button.addEventListener('click', () => openComposeContactPicker(button.dataset.composeContactTarget));
+    });
+    document.getElementById('compose-contact-search')?.addEventListener('input', renderComposeContactPicker);
+    document.getElementById('compose-contact-target')?.addEventListener('change', event => {
+      composeContactPickerTarget = event.target.value;
+    });
+    document.getElementById('btn-add-compose-contacts')?.addEventListener('click', addSelectedComposeContacts);
+    document.getElementById('btn-close-compose-contact-picker')?.addEventListener('click', closeComposeContactPicker);
+    document.getElementById('btn-cancel-compose-contact-picker')?.addEventListener('click', closeComposeContactPicker);
+    document.addEventListener('mousedown', event => {
+      if (!event.target.closest('.compose-emoji-wrap')) setComposeEmojiPickerOpen(false);
+    });
+    document.getElementById('compose-from').onchange = event => {
+      populateComposeIdentitySelect(event.target.value);
+      updateComposeSignature({ resetChoice: true });
+    };
+    document.getElementById('compose-use-signature').onchange = () => updateComposeSignature();
+    document.getElementById('btn-toggle-accounts').onclick = () => toggleSidebarSection('accounts');
+    document.getElementById('btn-toggle-labels').onclick = () => toggleSidebarSection('labels');
+    document.getElementById('btn-add-account').onclick = openNewAccount;
+    document.getElementById('btn-add-label').onclick = openLabelManager;
+    document.getElementById('btn-save-label').onclick = saveLabel;
+    document.getElementById('btn-cancel-label-edit').onclick = () => resetLabelEditor({ focus: true });
+    document.getElementById('btn-open-mail-rules').onclick = () => openMailRulesModal();
+    document.getElementById('btn-r-rule').onclick = openRuleEditorFromMessage;
+    document.getElementById('rule-account-select').onchange = async event => {
+      ruleAccountId = event.target.value;
+      await populateRuleActionDropdowns();
+      await resetRuleEditor();
+      await loadRulesForAccount();
+    };
+    document.getElementById('btn-add-rule-condition').onclick = addRuleCondition;
+    document.getElementById('btn-save-rule').onclick = saveRuleFromForm;
+    document.getElementById('btn-cancel-rule-edit').onclick = () => resetRuleEditor({ focus: true });
+    document.getElementById('btn-apply-rules-existing').onclick = applyRulesToExistingMessages;
+    document.getElementById('label-color-picker').oninput = event => setLabelColor(event.target.value);
+    document.getElementById('label-color-hex').oninput = event => {
+      const color = normalizeLabelColor(event.target.value);
+      if (color) {
+        document.getElementById('label-color-picker').value = color;
+        document.querySelectorAll('#label-color-presets [data-label-color]').forEach(button => {
+          button.classList.toggle('selected', button.dataset.labelColor.toLowerCase() === color);
+        });
+      }
+      clearLabelError();
+    };
+    document.getElementById('label-name').oninput = clearLabelError;
+    document.getElementById('label-name').onkeydown = event => {
+      if (event.key === 'Enter') { event.preventDefault(); saveLabel(); }
+      if (event.key === 'Escape' && editingLabelId !== null) resetLabelEditor({ focus: true });
+    };
+    document.getElementById('btn-save-account').onclick = saveAccount;
+    document.getElementById('acc-receive-protocol')?.addEventListener('change', updateIncomingProtocolForm);
+    document.getElementById('acc-pop3-delete-policy')?.addEventListener('change', updateIncomingProtocolForm);
+    document.getElementById('btn-delete-account').onclick = deleteEditedAccount;
+    document.getElementById('btn-new-contact').onclick = () => resetContactEditor({ focus: true });
+    document.getElementById('btn-contact-subscriptions').onclick = openContactSubscriptions;
+    document.getElementById('btn-export-contacts').onclick = exportContactsVcard;
+    document.getElementById('btn-shortcuts').onclick = openMailShortcutsModal;
+    document.getElementById('btn-add-alias').onclick = addAccountAlias;
+    document.getElementById('btn-close-contact-subscriptions').onclick = () => document.getElementById('contact-subscriptions-modal').classList.remove('open');
+    document.getElementById('btn-close-contact-subscriptions-footer').onclick = () => document.getElementById('contact-subscriptions-modal').classList.remove('open');
+    document.getElementById('btn-contact-subscription-add').onclick = addContactSubscription;
+    document.getElementById('btn-contact-subscriptions-sync').onclick = syncAllContactSubscriptionsUI;
+    document.getElementById('btn-save-contact').onclick = saveContact;
+    document.getElementById('btn-delete-contact').onclick = deleteContact;
+    document.getElementById('btn-contact-avatar').onclick = chooseContactAvatar;
+    document.getElementById('contact-avatar-file').onchange = handleContactAvatarFile;
+    document.getElementById('btn-remove-contact-avatar').onclick = removeContactAvatar;
+    document.getElementById('btn-add-contact-group').onclick = addPendingContactGroup;
+    document.getElementById('contact-new-group').addEventListener('keydown', event => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        addPendingContactGroup();
+      }
+    });
+    ['contact-display-name', 'contact-first-name', 'contact-last-name', 'contact-emails'].forEach(id => {
+      document.getElementById(id).addEventListener('input', () => {
+        if (!contactAvatarData) updateContactAvatarPreview();
+      });
+    });
+    document.getElementById('btn-cancel-contact-edit').onclick = () => {
+      editingContactId = null;
+      document.getElementById('contact-editor').classList.add('hidden');
+      document.getElementById('contact-editor-empty').classList.remove('hidden');
+      document.querySelectorAll('.contact-list-row').forEach(row => row.classList.remove('active'));
+    };
+    document.getElementById('contacts-search').addEventListener('input', () => {
+      clearTimeout(contactsSearchTimer);
+      contactsSearchTimer = setTimeout(() => loadContacts().catch(() => {}), 180);
+    });
+    document.getElementById('contacts-group-filter').onchange = () => loadContacts().catch(() => {});
+    document.getElementById('btn-settings').onclick = openSettings;
+    document.getElementById('btn-add-spam-rule')?.addEventListener('click', addSpamRuleFromSettings);
+    document.getElementById('spam-rule-search')?.addEventListener('input', renderSpamRuleSettings);
+    const collectedSpamDetails = document.querySelector('.spam-collected-box');
+    const collectedSpamSummary = collectedSpamDetails?.querySelector('summary');
+    collectedSpamSummary?.addEventListener('click', event => {
+      event.preventDefault();
+      collectedSpamDetails.open = !collectedSpamDetails.open;
+      if (collectedSpamDetails.open) refreshSpamRuleSettings().catch(error => status(error.message, 'error'));
+    });
+    document.getElementById('btn-export-backup').onclick = exportCompleteBackup;
+    document.getElementById('btn-import-backup').onclick = importCompleteBackup;
+    document.getElementById('btn-import-eml').onclick = importEmlMessages;
+    document.getElementById('btn-allow-remote').onclick = openRemoteContentDialog;
+    document.getElementById('btn-display-selected-remote').onclick = displaySelectedRemoteContent;
+    document.getElementById('btn-display-all-remote').onclick = () => {
+      const urls = Viewer.getRemoteResources().map(resource => resource.url).filter(Boolean);
+      Viewer.allowAllRemote();
+      persistRemotePermissions(urls);
+      closeRemoteContentDialog();
+    };
+    document.getElementById('btn-select-all-remote').onclick = () => {
+      document.querySelectorAll('#remote-content-modal .remote-resource-checkbox:not(:disabled)').forEach(input => { input.checked = true; });
+      updateRemoteDialogState();
+    };
+    document.getElementById('btn-select-none-remote').onclick = () => {
+      document.querySelectorAll('#remote-content-modal .remote-resource-checkbox:not(:disabled)').forEach(input => { input.checked = false; });
+      updateRemoteDialogState();
+    };
+    document.getElementById('btn-theme').onclick = () => {
+      const themeCycle = ['dark', 'light', 'sagasser'];
+      const currentIndex = themeCycle.indexOf(document.documentElement.dataset.theme);
+      const nextTheme = themeCycle[(currentIndex + 1 + themeCycle.length) % themeCycle.length];
+      applySetting('theme', nextTheme);
+    };
+    document.getElementById('btn-mode').onclick = event => {
+      const mode = Viewer.toggleMode();
+      event.currentTarget.querySelector('span').textContent =
+        t(mode === 'html' ? 'action.viewtext' : 'action.viewhtml');
+    };
+
+    document.getElementById('btn-r-restore').onclick = () =>
+      Viewer.current && quickAction(Viewer.current.meta, 'restore');
+    document.getElementById('btn-r-delete').onclick = () =>
+      Viewer.current && quickAction(Viewer.current.meta, 'delete');
+    document.getElementById('btn-r-spam').onclick = () =>
+      Viewer.current && quickAction(Viewer.current.meta, 'spam');
+    document.getElementById('btn-r-flag').onclick = () =>
+      Viewer.current && quickAction(Viewer.current.meta, 'flag');
+    document.getElementById('btn-r-print').onclick = () => Viewer.print();
+    document.getElementById('btn-r-seen').onclick = () => {
+      if (!Viewer.current) return;
+      setSeenState(Viewer.current.meta, !Boolean(Viewer.current.meta.seen)).catch(error => status(error.message));
+    };
+    document.getElementById('btn-reply').onclick = () =>
+      Viewer.current && openCompose(Viewer.current, 'reply');
+    document.getElementById('btn-reply-all').onclick = () =>
+      Viewer.current && openCompose(Viewer.current, 'reply-all');
+    document.getElementById('btn-forward').onclick = () =>
+      Viewer.current && openCompose(Viewer.current, 'forward');
+    document.getElementById('btn-r-contact').onclick = openCurrentCorrespondentContact;
+    document.getElementById('btn-r-label').onclick = toggleLabelMenu;
+
+    document.addEventListener('click', event => {
+      if (!event.target.closest('.compose-address-wrap')) {
+        hideContactSuggestions('compose-to');
+        hideContactSuggestions('compose-cc');
+        hideContactSuggestions('compose-bcc');
+      }
+      const menu = document.getElementById('label-menu');
+      if (!menu.classList.contains('hidden') && !menu.contains(event.target)) {
+        menu.classList.add('hidden');
+      }
+      const quickLabelMenu = document.getElementById('quick-label-menu');
+      if (!quickLabelMenu.classList.contains('hidden')
+          && !quickLabelMenu.contains(event.target)
+          && !event.target.closest('[data-act="label"]')) {
+        closeQuickLabelMenu();
+      }
+      const bulkLabelMenu = document.getElementById('bulk-label-menu');
+      const bulkLabelButton = document.getElementById('btn-bulk-label');
+      if (!bulkLabelMenu.classList.contains('hidden')
+          && !bulkLabelMenu.contains(event.target)
+          && !bulkLabelButton.contains(event.target)) {
+        closeBulkLabelMenu();
+      }
+      const activityPanel = document.getElementById('activity-panel');
+      const activityButton = document.getElementById('btn-activity');
+      if (!activityPanel.classList.contains('hidden')
+          && !activityPanel.contains(event.target)
+          && !activityButton.contains(event.target)) {
+        toggleActivityPanel(false);
+      }
+    });
+
+    document.getElementById('btn-activity').onclick = event => {
+      event.stopPropagation();
+      toggleActivityPanel();
+    };
+    document.getElementById('btn-clear-activity').onclick = clearCompletedActivity;
+    document.getElementById('btn-stop-sync').onclick = event => {
+      event.stopPropagation();
+      stopSync();
+    };
+    wirePaneResizer(document.getElementById('resize-sidebar'), 'sidebar');
+    wirePaneResizer(document.getElementById('resize-list'), 'list');
+    document.getElementById('mail-list').addEventListener('scroll', closeQuickLabelMenu, { passive: true });
+    window.addEventListener('resize', () => {
+      applyPaneDimensions();
+      closeQuickLabelMenu();
+    });
+
+    let searchTimer;
+    const searchInput = document.getElementById('search-input');
+    const clearSearchButton = document.getElementById('btn-clear-search');
+    searchInput.addEventListener('input', event => {
+      updateSearchClearButton();
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => searchFor(event.target.value), 280);
+    });
+    searchInput.addEventListener('keydown', event => {
+      if (event.key !== 'Escape' || !searchInput.value) return;
+      event.preventDefault();
+      clearTimeout(searchTimer);
+      clearSearch().catch(error => status(`${t('error')} : ${error.message}`, 'error'));
+    });
+    clearSearchButton.onclick = () => {
+      clearTimeout(searchTimer);
+      clearSearch().catch(error => status(`${t('error')} : ${error.message}`, 'error'));
+    };
+    updateSearchClearButton();
+
+    wireContactAutocomplete('compose-to');
+    wireContactAutocomplete('compose-cc');
+    wireContactAutocomplete('compose-bcc');
+    document.querySelectorAll('[data-close]').forEach(button => { button.onclick = closeModals; });
+    document.getElementById('brand')?.addEventListener('click', openAboutModal);
+    document.getElementById('brand')?.addEventListener('keydown', event => {
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); openAboutModal(); }
+    });
+    document.getElementById('update-notice')?.addEventListener('click', openAboutModal);
+    document.getElementById('btn-check-update')?.addEventListener('click', () => checkForUpdates(true));
+    document.getElementById('set-signature-account').onchange = event => loadSignatureEditor(event.target.value);
+    document.getElementById('btn-save-signature').onclick = saveSignatureSettings;
+    [
+      'set-signature-enabled', 'set-signature-format', 'set-signature-new',
+      'set-signature-replies', 'set-signature-forwards', 'set-signature-separator',
+      'set-signature-reply-position', 'set-signature-forward-position',
+    ].forEach(id => { document.getElementById(id).onchange = renderSettingsSignaturePreview; });
+    document.getElementById('set-signature-content').oninput = renderSettingsSignaturePreview;
+    document.getElementById('set-accent-preset').onchange = event => {
+      const choice = event.target.value;
+      if (choice === 'custom') {
+        document.getElementById('set-accent-color').focus();
+        syncAccentControls();
+        return;
+      }
+      const preset = ACCENT_PRESETS.find(item => item.id === choice);
+      if (preset) applySetting('accentColor', preset.color);
+    };
+    document.getElementById('set-accent-color').oninput = event => syncAccentControls(event.target.value);
+    document.getElementById('set-accent-color').onchange = event => applySetting('accentColor', event.target.value);
+    document.getElementById('set-accent-hex').oninput = event => {
+      const value = String(event.target.value || '').trim();
+      if (/^#?[0-9a-fA-F]{3}$/.test(value) || /^#?[0-9a-fA-F]{6}$/.test(value)) {
+        syncAccentControls(normalizeHexColor(value));
+      }
+    };
+    const commitAccentHex = event => {
+      const value = String(event.currentTarget.value || '').trim();
+      if (!value) {
+        syncAccentControls();
+        return;
+      }
+      if (!/^#?[0-9a-fA-F]{3}$/.test(value) && !/^#?[0-9a-fA-F]{6}$/.test(value)) {
+        status(t('settings.accentInvalid'), 'error');
+        syncAccentControls();
+        return;
+      }
+      applySetting('accentColor', value);
+    };
+    document.getElementById('set-accent-hex').addEventListener('blur', commitAccentHex);
+    document.getElementById('set-accent-hex').addEventListener('keydown', event => {
+      if (event.key === 'Enter') commitAccentHex({ currentTarget: event.currentTarget });
+    });
+    document.querySelectorAll('.accent-swatch').forEach(button => {
+      button.onclick = () => applySetting('accentColor', button.dataset.color);
+    });
+    document.getElementById('set-theme').onchange = event => applySetting('theme', event.target.value);
+    document.getElementById('set-locale').onchange = event => applySetting('locale', event.target.value);
+    document.getElementById('set-layout').onchange = event => applySetting('layout', event.target.value);
+    document.getElementById('set-blockremote').onchange = event =>
+      applySetting('blockRemoteImages', event.target.value === '1');
+    document.getElementById('btn-remote-whitelist-add').onclick = addRemoteWhitelistDomain;
+    document.getElementById('remote-whitelist-input').onkeydown = event => {
+      if (event.key === 'Enter') { event.preventDefault(); addRemoteWhitelistDomain(); }
+    };
+    document.getElementById('set-conversations').onchange = event =>
+      applySetting('conversationView', event.target.value === '1');
+    document.getElementById('set-newmail-notify').onchange = event =>
+      applySetting('newMailNotifications', event.target.value === '1');
+    document.getElementById('set-auto-read').onchange = event =>
+      applySetting('autoMarkRead', event.target.value === '1');
+    document.getElementById('set-read-delay').onchange = event =>
+      applySetting('markReadDelaySeconds', Math.max(0, Math.min(3600, Number(event.target.value) || 0)));
+    document.getElementById('set-group-date').onchange = event =>
+      applySetting('groupByDate', event.target.value === '1');
+    document.getElementById('set-default-account').onchange = event =>
+      applySetting('defaultAccountId', event.target.value);
+
+    document.getElementById('acc-logo-file')?.addEventListener('change', async event => {
+      const file = event.target.files?.[0] || null;
+      if (!file) return;
+      try {
+        const data = await readAccountLogoFile(file);
+        accountField('acc-logo-data').value = data;
+        updateAccountLogoPreview(data);
+      } catch (error) {
+        setAccountStatus(`${t('error')} : ${error.message}`, 'error');
+      } finally {
+        event.target.value = '';
+      }
+    });
+    document.getElementById('btn-clear-account-logo')?.addEventListener('click', () => {
+      accountField('acc-logo-data').value = '';
+      updateAccountLogoPreview('');
+    });
+    ['acc-name', 'acc-email', 'acc-color'].forEach(id => {
+      document.getElementById(id)?.addEventListener('input', () => {
+        if (!accountField('acc-logo-data').value) updateAccountLogoPreview('');
+      });
+    });
+
+    document.getElementById('list-sort').onchange = event =>
+      applyListPreference('sortBy', event.target.value);
+    document.getElementById('list-sort-direction').onclick = () =>
+      applyListPreference('sortDirection', (config.sortDirection || 'desc') === 'desc' ? 'asc' : 'desc');
+    document.getElementById('btn-date-groups').onclick = () =>
+      applyListPreference('groupByDate', config.groupByDate === false);
+
+    document.addEventListener('keydown', event => {
+      const modifier = event.ctrlKey || event.metaKey;
+      const modalOpen = document.querySelector('.modal-veil.open');
+      if (modifier && event.key.toLowerCase() === 'w' && activeReaderTabKey !== 'preview' && !modalOpen) {
+        event.preventDefault();
+        closeReaderTab(activeReaderTabKey);
+        return;
+      }
+      if (event.ctrlKey && event.key === 'Tab' && !modalOpen) {
+        event.preventDefault();
+        const keys = ['preview', ...readerTabs.map(tab => tab.key)];
+        const current = Math.max(0, keys.indexOf(activeReaderTabKey));
+        const direction = event.shiftKey ? -1 : 1;
+        const next = (current + direction + keys.length) % keys.length;
+        activateReaderTab(keys[next]);
+        return;
+      }
+      // Les raccourcis ci-dessous ne doivent jamais interférer avec la saisie
+      // de texte (champ de formulaire, éditeur de rédaction, etc.).
+      if (!isEditableTarget(event.target)) {
+        if (modifier && event.key.toLowerCase() === 'n' && !modalOpen) {
+          event.preventDefault();
+          openCompose(null, 'new');
+          return;
+        }
+        if (modifier && event.key.toLowerCase() === 'p' && !modalOpen && Viewer.current) {
+          event.preventDefault();
+          Viewer.print();
+          return;
+        }
+        if (event.key === 'Delete' && !modalOpen && Viewer.current) {
+          event.preventDefault();
+          quickAction(Viewer.current.meta, 'delete');
+          return;
+        }
+        if (modifier && event.key === '/' && !modalOpen) {
+          event.preventDefault();
+          openMailShortcutsModal();
+          return;
+        }
+      }
+      if (event.key === 'Escape') {
+        toggleActivityPanel(false);
+        closeBulkLabelMenu();
+        if (bulkSelection.length && !modalOpen) list.clearSelection();
+      }
+    });
+
+    try {
+      Neutralino.events.on('windowClose', openQuitDialog);
+      Neutralino.events.on('filesDropped', handleNativeFilesDropped);
+    } catch (error) {
+      console.warn('[FARO Mail] Événements Neutralino indisponibles :', error);
+    }
+  }
+
+  window.addEventListener('DOMContentLoaded', async () => {
+    try { Neutralino.init(); } catch {}
+    wire();
+    try {
+      await ensureBundledWindowsEngine();
+    } catch (error) {
+      console.error('[FARO Mail] Démarrage du moteur Windows :', error);
+      startupMessage(t('startup.error', { message: error.message }), { error: true });
+      status(`${t('error')} : ${error.message}`, 'error');
+      try {
+        await Neutralino.os.showMessageBox(
+          'FARO Mail',
+          `Le moteur FARO Mail n’a pas pu démarrer.\n\n${error.message}`,
+          'OK',
+          'ERROR',
+        );
+      } catch {}
+      return;
+    }
+    connect();
+  });
+
+  return {
+    rpc,
+    status,
+    closeModals,
+    openCompose,
+    composeState,
+    composeEnvelope,
+    composeContext,
+    setComposeContext,
+    loadComposeState,
+    refreshSpamRuleSettings,
+    openExternal,
+    confirmAction,
+    previewExternalTarget,
+    clearExternalTarget,
+    saveAttachment,
+    get config() { return config; },
+    get accounts() { return accounts.map(account => ({ ...account })); },
+    accountColor: id => accounts.find(account => account.id === id)?.color || 'var(--fg-faint)',
+    accountEmail: id => accounts.find(account => account.id === id)?.email || '',
+    accountName: id => accounts.find(account => account.id === id)?.displayName || accounts.find(account => account.id === id)?.email || '',
+    contactAvatar: value => contactDirectoryEntry(value)?.avatarData || '',
+  };
+})();

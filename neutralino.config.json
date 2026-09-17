@@ -1,0 +1,58 @@
+{
+  "applicationId": "eu.faromail.app",
+  "version": "0.4.3",
+  "defaultMode": "window",
+  "port": 0,
+  "documentRoot": "/resources/",
+  "url": "/index.html",
+  "enableServer": true,
+  "enableNativeAPI": true,
+  "tokenSecurity": "one-time",
+  "logging": {
+    "enabled": true,
+    "writeToLogFile": false
+  },
+  "nativeAllowList": [
+    "app.*",
+    "os.open",
+    "os.updateSpawnedProcess",
+    "os.spawnProcess",
+    "os.showSaveDialog",
+    "os.showOpenDialog",
+    "window.*",
+    "storage.*",
+    "filesystem.readFile",
+    "filesystem.readBinaryFile",
+    "filesystem.writeFile",
+    "filesystem.createDirectory",
+    "filesystem.writeBinaryFile",
+    "filesystem.getStats"
+  ],
+  "modes": {
+    "window": {
+      "title": "FARO Mail 0.4.3",
+      "width": 1440,
+      "height": 900,
+      "minWidth": 1000,
+      "minHeight": 640,
+      "center": true,
+      "resizable": true,
+      "exitProcessOnClose": false,
+      "icon": "/resources/icons/appIcon.png",
+      "emitDropEvents": true
+    }
+  },
+  "cli": {
+    "binaryName": "faromail",
+    "resourcesPath": "/resources/",
+    "extensions": [],
+    "clientLibrary": "/resources/js/neutralino.js",
+    "binaryVersion": "6.8.0",
+    "clientVersion": "6.8.0"
+  },
+  "applicationName": "FARO Mail",
+  "applicationIcon": "resources/icons/appIcon.png",
+  "author": "R.Trunk (FARO Solutions)",
+  "description": "FARO Mail - client de messagerie et planning portable",
+  "copyright": "Copyright © R.Trunk / FARO Solutions"
+}

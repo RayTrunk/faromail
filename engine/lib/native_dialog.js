@@ -1,0 +1,247 @@
+/**
+ * FARO Mail — Sélecteurs de fichiers natifs du moteur Node.js.
+ *
+ * Neutralino fournit normalement ces dialogues. Certaines versions compilées
+ * sous Linux ferment toutefois la promesse sans afficher de fenêtre. Ce module
+ * utilise les outils graphiques disponibles sur le poste comme solution fiable.
+ */
+'use strict';
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawn } = require('child_process');
+
+function safeDefaultName(value) {
+  const name = String(value || 'FaroMail-sauvegarde.zip')
+    .replace(/[\\/\0\r\n]/g, '_')
+    .trim();
+  return name || 'FaroMail-sauvegarde.zip';
+}
+
+function defaultDirectory() {
+  const documents = path.join(os.homedir(), 'Documents');
+  return fs.existsSync(documents) ? documents : os.homedir();
+}
+
+function runCommand(command, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+      env: process.env,
+    });
+    let stdout = '';
+    let stderr = '';
+
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.stderr.on('data', chunk => { stderr += chunk; });
+
+    child.once('error', error => {
+      if (error && error.code === 'ENOENT') {
+        resolve({ available: false, cancelled: false, output: '', error: '' });
+        return;
+      }
+      reject(error);
+    });
+
+    child.once('close', code => {
+      if (code === 0) {
+        resolve({ available: true, cancelled: false, output: stdout.trim(), error: stderr.trim() });
+        return;
+      }
+      // Zenity/Yad/KDialog utilisent 1 ou 255 lorsque l'utilisateur annule.
+      if (code === 1 || code === 255) {
+        resolve({ available: true, cancelled: true, output: '', error: stderr.trim() });
+        return;
+      }
+      reject(new Error(stderr.trim() || `${command} s’est terminé avec le code ${code}`));
+    });
+  });
+}
+
+async function tryCandidates(candidates) {
+  for (const candidate of candidates) {
+    const result = await runCommand(candidate.command, candidate.args);
+    if (!result.available) continue;
+    if (result.cancelled) return null;
+    return result.output || null;
+  }
+  throw new Error(
+    'Aucun sélecteur de fichiers graphique n’est disponible. Installez zenity, yad ou kdialog.'
+  );
+}
+
+function linuxCandidates({ mode, title, defaultName }) {
+  const directory = defaultDirectory();
+  const initial = mode === 'save'
+    ? path.join(directory, safeDefaultName(defaultName))
+    : `${directory}${path.sep}`;
+
+  const commonZenity = [
+    '--file-selection',
+    `--title=${title}`,
+    '--file-filter=Sauvegardes ZIP | *.zip',
+    '--file-filter=Tous les fichiers | *',
+    `--filename=${initial}`,
+  ];
+  if (mode === 'save') commonZenity.push('--save', '--confirm-overwrite');
+
+  const commonYad = [
+    '--file-selection',
+    `--title=${title}`,
+    '--file-filter=Sauvegardes ZIP | *.zip',
+    '--file-filter=Tous les fichiers | *',
+    `--filename=${initial}`,
+  ];
+  if (mode === 'save') commonYad.push('--save', '--confirm-overwrite');
+
+  const kdialogArgs = mode === 'save'
+    ? ['--title', title, '--getsavefilename', initial, 'Sauvegardes ZIP (*.zip)']
+    : ['--title', title, '--getopenfilename', directory, 'Sauvegardes ZIP (*.zip)'];
+
+  return [
+    { command: 'zenity', args: commonZenity },
+    { command: 'yad', args: commonYad },
+    { command: 'kdialog', args: kdialogArgs },
+  ];
+}
+
+function macCandidates({ mode, title, defaultName }) {
+  const escapedTitle = String(title).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  const escapedName = safeDefaultName(defaultName).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  const script = mode === 'save'
+    ? `POSIX path of (choose file name with prompt "${escapedTitle}" default name "${escapedName}")`
+    : `POSIX path of (choose file with prompt "${escapedTitle}")`;
+  return [{ command: 'osascript', args: ['-e', script] }];
+}
+
+function windowsCandidates({ mode, title, defaultName }) {
+  const dialogClass = mode === 'save' ? 'SaveFileDialog' : 'OpenFileDialog';
+  const properties = [
+    `$dialog = New-Object System.Windows.Forms.${dialogClass}`,
+    `$dialog.Title = ${JSON.stringify(String(title))}`,
+    '$dialog.Filter = "Sauvegarde FARO Mail (*.zip)|*.zip|Tous les fichiers (*.*)|*.*"',
+    `$dialog.InitialDirectory = ${JSON.stringify(defaultDirectory())}`,
+  ];
+  if (mode === 'save') {
+    properties.push(`$dialog.FileName = ${JSON.stringify(safeDefaultName(defaultName))}`);
+    properties.push('$dialog.OverwritePrompt = $true');
+  }
+  properties.push('if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dialog.FileName }');
+  const script = [
+    'Add-Type -AssemblyName System.Windows.Forms',
+    ...properties,
+  ].join('; ');
+  return [
+    { command: 'powershell.exe', args: ['-NoProfile', '-STA', '-Command', script] },
+    { command: 'pwsh', args: ['-NoProfile', '-STA', '-Command', script] },
+  ];
+}
+
+async function showBackupDialog({ mode, defaultName = '', title = '' } = {}) {
+  if (mode !== 'save' && mode !== 'open') throw new Error('Mode de dialogue invalide');
+  const resolvedTitle = String(title || (mode === 'save'
+    ? 'Enregistrer la sauvegarde FARO Mail'
+    : 'Choisir une sauvegarde FARO Mail'));
+
+  let candidates;
+  if (process.platform === 'linux') {
+    candidates = linuxCandidates({ mode, title: resolvedTitle, defaultName });
+  } else if (process.platform === 'darwin') {
+    candidates = macCandidates({ mode, title: resolvedTitle, defaultName });
+  } else if (process.platform === 'win32') {
+    candidates = windowsCandidates({ mode, title: resolvedTitle, defaultName });
+  } else {
+    throw new Error(`Sélecteur de fichiers non pris en charge sur ${process.platform}`);
+  }
+
+  const selected = await tryCandidates(candidates);
+  if (!selected) return null;
+  return path.resolve(selected);
+}
+
+function splitSelectedPaths(output) {
+  return String(output || '')
+    .split(/\r?\n/)
+    .map(value => value.trim())
+    .filter(Boolean)
+    .map(value => path.resolve(value));
+}
+
+function linuxEmlCandidates({ title }) {
+  const directory = `${defaultDirectory()}${path.sep}`;
+  const common = [
+    '--file-selection',
+    '--multiple',
+    '--separator=\n',
+    `--title=${title}`,
+    '--file-filter=Messages EML | *.eml *.EML',
+    '--file-filter=Tous les fichiers | *',
+    `--filename=${directory}`,
+  ];
+  return [
+    { command: 'zenity', args: common },
+    { command: 'yad', args: common },
+    {
+      command: 'kdialog',
+      args: ['--title', title, '--getopenfilename', defaultDirectory(), 'Messages EML (*.eml)', '--multiple', '--separate-output'],
+    },
+  ];
+}
+
+function macEmlCandidates({ title }) {
+  const escapedTitle = String(title).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  const script = [
+    `set selectedFiles to choose file with prompt "${escapedTitle}" with multiple selections allowed`,
+    'set output to ""',
+    'repeat with selectedFile in selectedFiles',
+    'set output to output & (POSIX path of selectedFile) & linefeed',
+    'end repeat',
+    'return output',
+  ].join('\n');
+  return [{ command: 'osascript', args: ['-e', script] }];
+}
+
+function windowsEmlCandidates({ title }) {
+  const script = [
+    'Add-Type -AssemblyName System.Windows.Forms',
+    '$dialog = New-Object System.Windows.Forms.OpenFileDialog',
+    `$dialog.Title = ${JSON.stringify(String(title))}`,
+    '$dialog.Filter = "Messages EML (*.eml)|*.eml|Tous les fichiers (*.*)|*.*"',
+    `$dialog.InitialDirectory = ${JSON.stringify(defaultDirectory())}`,
+    '$dialog.Multiselect = $true',
+    'if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $dialog.FileNames | ForEach-Object { Write-Output $_ } }',
+  ].join('; ');
+  return [
+    { command: 'powershell.exe', args: ['-NoProfile', '-STA', '-Command', script] },
+    { command: 'pwsh', args: ['-NoProfile', '-STA', '-Command', script] },
+  ];
+}
+
+async function showEmlDialog({ title = 'Importer des messages EML' } = {}) {
+  let candidates;
+  if (process.platform === 'linux') {
+    candidates = linuxEmlCandidates({ title });
+  } else if (process.platform === 'darwin') {
+    candidates = macEmlCandidates({ title });
+  } else if (process.platform === 'win32') {
+    candidates = windowsEmlCandidates({ title });
+  } else {
+    throw new Error(`Sélecteur de fichiers non pris en charge sur ${process.platform}`);
+  }
+
+  for (const candidate of candidates) {
+    const result = await runCommand(candidate.command, candidate.args);
+    if (!result.available) continue;
+    if (result.cancelled) return [];
+    return splitSelectedPaths(result.output);
+  }
+  throw new Error(
+    'Aucun sélecteur de fichiers graphique n’est disponible. Installez zenity, yad ou kdialog.'
+  );
+}
+
+module.exports = { showBackupDialog, showEmlDialog };

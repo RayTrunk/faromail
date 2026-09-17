@@ -1,0 +1,45 @@
+/* FARO Mail — Thème « Sagasser » (accordé aux couleurs de sagasser.de)
+ * Rouge de marque #c4362c, bleu secondaire #3681bb, fond gris clair #f4f5f7.
+ * Pour créer un thème personnalisé : copiez ce fichier dans themes/,
+ * renommez [data-theme="..."], ajustez les variables, déclarez-le
+ * dans Paramètres. Aucune autre modification nécessaire. */
+:root[data-theme="sagasser"] {
+  --bg-app: #f4f5f7;
+  --bg-panel: #ffffff;
+  --bg-panel-2: #ffffff;
+  --bg-hover: #eef0f3;
+  --bg-active: #e5e8ec;
+  --bg-input: #ffffff;
+
+  --fg: #282828;
+  --fg-strong: #171717;
+  --fg-muted: #707070;
+  --fg-faint: #a0a0a0;
+
+  /* Rouge de marque sagasser.de (liens, boutons principaux) */
+  --accent: #c4362c;
+  --accent-soft: rgba(196, 54, 44, .12);
+  --accent-fg: #ffffff;
+
+  /* Statistiques : rouge/bleu de marque, volontairement très distincts */
+  --stats-received: #3681bb;
+  --stats-sent: #c4362c;
+
+  /* Sémantique : rose distinct du rouge de marque pour rester lisible */
+  --danger: #d1435f;
+  --danger-soft: rgba(209, 67, 95, .10);
+  --ok: #3681bb;
+  --warn: #c9822a;
+  --warn-soft: rgba(201, 130, 42, .12);
+
+  --border: #dfe2e6;
+  --border-soft: #ececef;
+  --shadow: 0 8px 28px rgba(40, 40, 40, .12);
+  --radius: 8px;
+  --radius-lg: 12px;
+
+  --row-unread-fg: var(--fg-strong);
+  --row-height: 68px;
+
+  color-scheme: light;
+}

@@ -1,0 +1,49 @@
+/* FARO Mail — Thème sombre (variante claire/teal, moins contrastée que le
+ * noir profond d'origine).
+ * Pour créer un thème personnalisé : copiez ce fichier dans themes/,
+ * renommez [data-theme="..."], ajustez les variables, déclarez-le
+ * dans Paramètres. Aucune autre modification nécessaire. */
+:root[data-theme="dark"] {
+  /* Fonds gris-ardoise, plus clairs que la version précédente */
+  --bg-app: #1c2430;
+  --bg-panel: #232c3a;
+  --bg-panel-2: #29323f;
+  --bg-hover: #333e4f;
+  --bg-active: #3d4a5e;
+  --bg-input: #1a222d;
+
+  /* Texte */
+  --fg: #e5e9f0;
+  --fg-strong: #ffffff;
+  --fg-muted: #a8b3c2;
+  --fg-faint: #778395;
+
+  /* Accent sarcelle/cyan, distinct du violet précédent */
+  --accent: #2fb6c4;
+  --accent-soft: rgba(47, 182, 196, .18);
+  --accent-fg: #08262a;
+
+  /* Statistiques : séries volontairement très distinctes */
+  --stats-received: #5fb0f0;
+  --stats-sent: #f0a15f;
+
+  /* Sémantique */
+  --danger: #ef6f8f;
+  --danger-soft: rgba(239, 111, 143, .14);
+  --ok: #4ecdc4;
+  --warn: #e0b054;
+  --warn-soft: rgba(224, 176, 84, .15);
+
+  /* Structure */
+  --border: #3a4556;
+  --border-soft: #2e3745;
+  --shadow: 0 8px 28px rgba(0, 0, 0, .38);
+  --radius: 8px;
+  --radius-lg: 12px;
+
+  /* Liste des messages */
+  --row-unread-fg: var(--fg-strong);
+  --row-height: 68px;
+
+  color-scheme: dark;
+}

@@ -1,0 +1,36 @@
+FARO Mail __FAROMAIL_VERSION__ — eigenständiges Windows-x86_64-Paket
+
+Start:
+  Doppelklick auf FaroMail.exe
+
+FaroMail.exe startet automatisch den eingebetteten Mail-Motor (Engine).
+Es wird kein VBS-, PowerShell- oder CMD-Starter mehr verwendet.
+
+Node.js:
+  - eingebettete Version: __NODE_VERSION__
+  - interne Laufzeitumgebung: .\runtime\node\node.exe
+  - es ist keine separate Installation von Node.js oder npm auf dem Zielrechner nötig.
+
+TLS-Zertifikate:
+  - die Engine nutzt zusätzlich den von Windows verwalteten Zertifikatspeicher;
+  - Root-Zertifikate, die von einem Antivirenprogramm, einem Firmenproxy oder
+    einer lokalen PKI installiert wurden, werden dadurch erkannt, ohne die
+    TLS-Prüfung zu deaktivieren.
+
+Systemvoraussetzungen:
+  - Windows 10 oder Windows 11 x64;
+  - Microsoft Edge WebView2 Runtime;
+  - gegebenenfalls Microsoft Visual C++ 2015-2022 x64, falls ein natives Modul
+    dies benötigt.
+
+Der gesamte Ordner ist portabel. FaroMail.exe ist die einzige auszuführende
+Datei, aber die Ordner runtime, engine und data gehören zur Anwendung und
+dürfen nicht einzeln verschoben werden.
+
+Die Oberflächen-Ressourcen sind direkt in FaroMail.exe eingebettet:
+im Windows-Paket gibt es keine separate Datei resources.neu mehr.
+
+Mit --with-data enthält das Paket Konten und Nachrichten. Passwörter, die in
+den System-Schlüsselbund migriert wurden, werden dabei nicht mitkopiert.
+Der übrige Inhalt bleibt dennoch vertraulich und muss entsprechend geschützt
+werden.

@@ -1,0 +1,8 @@
+PDF.js (pdfjs-dist) is developed and maintained by Mozilla and contributors.
+https://github.com/mozilla/pdf.js
+
+Licensed under the Apache License, Version 2.0. See:
+https://github.com/mozilla/pdf.js/blob/master/LICENSE
+
+Vendored locally in FARO Mail for offline use — no CDN/network dependency
+at runtime, consistent with the rest of resources/vendor/.
