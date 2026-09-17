@@ -75,26 +75,43 @@ function providerKey(domain) {
   return '';
 }
 
+const MAX_ICON_REDIRECTS = 3;
+
+// redirect:'follow' contournerait isPublicHostname() : le serveur d'un
+// domaine expéditeur (public, donc accepté au premier contrôle) peut
+// répondre par une redirection 3xx vers une adresse interne (192.168.x.x,
+// service de métadonnées cloud, etc.). Chaque saut est donc revalidé
+// manuellement avant d'être suivi.
 async function fetchWithTimeout(url, timeout = 2500) {
   if (typeof fetch !== 'function') return null;
-  let hostname = '';
-  try { hostname = new URL(url).hostname; } catch { return null; }
-  if (!(await isPublicHostname(hostname))) return null;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
   try {
-    const response = await fetch(url, {
-      headers: { 'User-Agent': 'FARO Mail/0.2.23 icon-cache' },
-      redirect: 'follow',
-      signal: controller.signal,
-    });
-    if (!response.ok) return null;
-    const contentType = String(response.headers.get('content-type') || '').toLowerCase();
-    if (!/^image\//.test(contentType) && !contentType.includes('x-icon')) return null;
-    const arrayBuffer = await response.arrayBuffer();
-    if (!arrayBuffer || arrayBuffer.byteLength <= 0 || arrayBuffer.byteLength > MAX_ICON_BYTES) return null;
-    const mime = contentType.split(';')[0] || 'image/png';
-    return `data:${mime};base64,${Buffer.from(arrayBuffer).toString('base64')}`;
+    let currentUrl = url;
+    for (let hop = 0; hop <= MAX_ICON_REDIRECTS; hop++) {
+      let hostname = '';
+      try { hostname = new URL(currentUrl).hostname; } catch { return null; }
+      if (!(await isPublicHostname(hostname))) return null;
+      const response = await fetch(currentUrl, {
+        headers: { 'User-Agent': 'FARO Mail/0.2.23 icon-cache' },
+        redirect: 'manual',
+        signal: controller.signal,
+      });
+      if ([301, 302, 303, 307, 308].includes(response.status)) {
+        const location = response.headers.get('location');
+        if (!location) return null;
+        try { currentUrl = new URL(location, currentUrl).toString(); } catch { return null; }
+        continue;
+      }
+      if (!response.ok) return null;
+      const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+      if (!/^image\//.test(contentType) && !contentType.includes('x-icon')) return null;
+      const arrayBuffer = await response.arrayBuffer();
+      if (!arrayBuffer || arrayBuffer.byteLength <= 0 || arrayBuffer.byteLength > MAX_ICON_BYTES) return null;
+      const mime = contentType.split(';')[0] || 'image/png';
+      return `data:${mime};base64,${Buffer.from(arrayBuffer).toString('base64')}`;
+    }
+    return null;
   } catch {
     return null;
   } finally {
