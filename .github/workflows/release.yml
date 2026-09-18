@@ -29,40 +29,6 @@ jobs:
           ./security_check.sh
           python3 tools/check_version.py
 
-  linux:
-    needs: verify
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Install packaging tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y zip xz-utils build-essential python3
-
-      - name: Build portable Linux package
-        run: |
-          chmod +x build_linux.sh
-          ./build_linux.sh --fresh-npm
-
-      - name: Collect Linux files
-        run: |
-          mkdir -p release-linux
-          cp build/linux/*.zip release-linux/ 2>/dev/null || true
-          cp build/linux/*.tar.gz release-linux/ 2>/dev/null || true
-          cp build/linux/*.sha256 release-linux/ 2>/dev/null || true
-          test -n "$(find release-linux -maxdepth 1 -type f -print -quit)"
-
-      - name: Upload Linux package
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-linux
-          path: release-linux/*
-          if-no-files-found: error
-
   windows:
     needs: verify
     runs-on: windows-2022
@@ -80,11 +46,32 @@ jobs:
             exit $LASTEXITCODE
           }
 
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+          )
+          $iscc = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $iscc) {
+            $cmd = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+            if ($cmd) { $iscc = $cmd.Source }
+          }
+          if (-not $iscc) {
+            throw 'Inno Setup (ISCC.exe) not found on this runner.'
+          }
+          & $iscc packaging\windows\faromail.iss
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
       - name: Collect Windows files
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path release-windows -Force | Out-Null
           Copy-Item build\windows\*.zip release-windows\ -ErrorAction SilentlyContinue
+          Copy-Item build\windows\*.exe release-windows\ -ErrorAction SilentlyContinue
           Copy-Item build\windows\*.sha256 release-windows\ -ErrorAction SilentlyContinue
 
           if (-not (Get-ChildItem release-windows -File)) {
@@ -99,9 +86,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs:
-      - linux
-      - windows
+    needs: windows
     runs-on: ubuntu-latest
     permissions:
       contents: write
