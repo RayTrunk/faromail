@@ -11,6 +11,8 @@ FARO Mail is a lightweight, local-first desktop email client built with
 Neutralinojs and a self-contained Node.js engine. It manages several IMAP/SMTP
 accounts without requiring Node.js to be installed on the target computer.
 
+Currently released for **Windows only**.
+
 ## Highlights
 
 - Multiple IMAP and SMTP accounts with a unified inbox
@@ -27,7 +29,7 @@ accounts without requiring Node.js to be installed on the target computer.
 - Remote-content blocking and confirmation before opening external links
 - Light and dark themes, German, French and English interfaces
 - Complete ZIP backup and restore of settings, accounts, contacts, calendar and local mail
-- Portable Linux and Windows packages with an embedded Node.js runtime, plus a Windows installer
+- Portable ZIP package and Windows installer, both with an embedded Node.js runtime
 
 ## Privacy
 
@@ -40,21 +42,8 @@ without personal data. There is no FARO Mail cloud account and no telemetry.
 
 ## Download
 
-Portable Linux and Windows builds, plus a Windows installer, are attached to each
+A portable ZIP build and a Windows installer are attached to each
 [GitHub Release](https://github.com/RayTrunk/faromail/releases).
-
-### Linux
-
-Extract the archive and run:
-
-```bash
-chmod +x faromail faromail-app runtime/node/bin/node
-./check_portable.sh
-./faromail
-```
-
-The graphical interface requires GTK/WebKitGTK packages provided by the Linux
-distribution.
 
 ### Windows
 
@@ -72,9 +61,6 @@ on current Windows 10/11 installations).
 ## Build from source
 
 ```bash
-# Linux public package, without personal data
-./build_linux.sh --fresh-npm
-
 # Windows public package, from Windows PowerShell
 .\build_windows.ps1 --fresh-npm
 ```
@@ -94,8 +80,8 @@ This repository includes one command centre:
 ```
 
 - `init` creates/configures the GitHub repository and pushes the source
-- `build` asks GitHub Actions to build Linux and Windows, then downloads them
-- `release` updates the version, pushes a tag and publishes both packages
+- `build` asks GitHub Actions to build Windows, then downloads it
+- `release` updates the version, pushes a tag and publishes the Windows packages
 - `check` verifies versions and prevents personal data from being tracked
 
 Detailed instructions are available in [docs/PUBLISHING.md](docs/PUBLISHING.md).
