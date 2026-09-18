@@ -765,6 +765,21 @@ body.resizing-panes.resize-rows { cursor: row-resize; }
 .input-suffix input { width: 100%; }
 .input-suffix span { color: var(--fg-muted); font-size: 12px; }
 .field-hint { color: var(--fg-faint); font-size: 11.5px; }
+.account-provider-hint {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin: -4px 0 10px; padding: 7px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
+  border-radius: var(--radius);
+  background: var(--accent-soft); color: var(--fg);
+  font-size: 12px;
+}
+.account-provider-hint i { color: var(--accent); }
+.account-provider-hint-text { flex: 1; min-width: 160px; }
+.account-provider-hint-link {
+  background: none; border: none; padding: 0; margin: 0;
+  color: var(--accent); font-size: 12px; font-weight: 600;
+  text-decoration: underline; cursor: pointer;
+}
 
 .stats-modal-box { width: min(940px, 95vw); }
 #stats-body { gap: 16px; }

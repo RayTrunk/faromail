@@ -6258,6 +6258,29 @@ const App = (() => {
     accountField('acc-pop3-delete-days-field')?.classList.toggle('hidden', protocol !== 'pop3' || deletePolicy !== 'after_days');
   }
 
+  const ACCOUNT_PROVIDER_HINTS = {
+    google: { domains: ['gmail.com', 'googlemail.com'], url: 'https://myaccount.google.com/apppasswords', key: 'account.providerHint.google' },
+    apple: { domains: ['icloud.com', 'me.com', 'mac.com'], url: 'https://appleid.apple.com/account/manage', key: 'account.providerHint.apple' },
+  };
+
+  // Gmail (avec 2FA) et iCloud Mail exigent un mot de passe d'application à la
+  // place du mot de passe habituel pour tout client IMAP/SMTP tiers. Sans cet
+  // indice, l'échec de connexion ressemble à un identifiant/mot de passe
+  // incorrect et n'oriente pas vers la vraie cause.
+  function updateAccountProviderHint() {
+    const box = accountField('account-provider-hint');
+    if (!box) return;
+    const domain = String(accountField('acc-email')?.value || '').trim().toLowerCase().split('@')[1] || '';
+    const provider = Object.values(ACCOUNT_PROVIDER_HINTS).find(entry => entry.domains.includes(domain));
+    box.classList.toggle('hidden', !provider);
+    if (!provider) return;
+    box.dataset.url = provider.url;
+    const textElement = box.querySelector('.account-provider-hint-text');
+    if (textElement) textElement.textContent = t(provider.key);
+    const linkElement = box.querySelector('.account-provider-hint-link');
+    if (linkElement) linkElement.textContent = t('account.providerHint.link');
+  }
+
   function resetAccountForm() {
     editingAccountId = null;
     accountField('acc-id').value = '';
@@ -6288,6 +6311,7 @@ const App = (() => {
     accountField('acc-sync-interval').value = '5';
     accountField('acc-spam-retention').value = '30';
     accountField('account-password-hint').textContent = t('account.passwordRequired');
+    updateAccountProviderHint();
     document.getElementById('account-folders-section')?.classList.add('hidden');
     document.getElementById('account-folders-list').innerHTML = '';
     document.getElementById('account-aliases-section')?.classList.add('hidden');
@@ -6465,6 +6489,7 @@ const App = (() => {
       accountField('acc-sync-interval').value = Number(details.syncIntervalMinutes) || 0;
       accountField('acc-spam-retention').value = Number(details.spamRetentionDays) || 0;
       updateIncomingProtocolForm();
+      updateAccountProviderHint();
       setAccountStatus();
       accountField('acc-name').focus();
       loadAccountFolders(accountId, details);
@@ -8173,6 +8198,14 @@ const App = (() => {
     };
     document.getElementById('btn-save-account').onclick = saveAccount;
     document.getElementById('acc-receive-protocol')?.addEventListener('change', updateIncomingProtocolForm);
+    document.getElementById('acc-email')?.addEventListener('input', updateAccountProviderHint);
+    document.getElementById('account-provider-hint')?.querySelector('.account-provider-hint-link')
+      ?.addEventListener('click', async () => {
+        const url = document.getElementById('account-provider-hint')?.dataset.url;
+        if (!url) return;
+        try { await rpc('app.openExternal', { url }); }
+        catch { await Neutralino.os.open(url); }
+      });
     document.getElementById('acc-pop3-delete-policy')?.addEventListener('change', updateIncomingProtocolForm);
     document.getElementById('btn-delete-account').onclick = deleteEditedAccount;
     document.getElementById('btn-new-contact').onclick = () => resetContactEditor({ focus: true });
