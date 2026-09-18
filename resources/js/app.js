@@ -376,7 +376,7 @@ const App = (() => {
 
     const detail = bundledEngineLastError ? `\n\n${bundledEngineLastError}` : '';
     await writeEngineStartupLog(`ÉCHEC : Le moteur n’a pas répondu dans le délai imparti. Dernier motif de connexion : ${lastProbeFailureDetail || 'inconnu'}.${bundledEngineLastError ? ` ${bundledEngineLastError}` : ''}`);
-    throw new Error(`Le moteur FARO Mail n’a pas pu démarrer.${detail}\n\nConsultez data\\engine-startup.log.\n\nSi c'est le tout premier lancement après installation, un antivirus est peut-être en train d'analyser le moteur : patientez puis relancez FARO Mail.`);
+    throw new Error(t('startup.engineFailed', { detail }));
   }
 
   async function stopBundledWindowsEngine() {

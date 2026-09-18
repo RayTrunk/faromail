@@ -130,7 +130,7 @@ class VirtualMailList {
     div.innerHTML = `
       <span class="read-state-dot"></span>
       ${isThread ? `<button class="thread-toggle" type="button" aria-expanded="${expanded ? 'true' : 'false'}"><i class="fa-solid fa-chevron-${expanded ? 'down' : 'right'}"></i></button>` : ''}
-      <button class="mail-select" type="button" title="${this.escape(window.t?.('selection.select') || 'Sélectionner')}">
+      <button class="mail-select" type="button" title="${this.escape(window.t?.('selection.select') || 'Auswählen')}">
         <i class="${this.selectedKeys.has(key) ? 'fa-solid fa-square-check' : 'fa-regular fa-square'}"></i>
       </button>
       ${this.avatarHtml(row, sender)}
@@ -255,7 +255,7 @@ class VirtualMailList {
 
   senderLabel(row) {
     if (row?.display_mode === 'sent' || row?.folder_role === 'sent') return row.to_addr || row.to_name || window.t?.('mail.unknownRecipient') || 'Destinataire inconnu';
-    return row?.contact_name || row?.from_name || row?.from_addr || window.t?.('mail.unknownSender') || 'Expéditeur inconnu';
+    return row?.contact_name || row?.from_name || row?.from_addr || window.t?.('mail.unknownSender') || 'Unbekannter Absender';
   }
 
   formatDate(value) {

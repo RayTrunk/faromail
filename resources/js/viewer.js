@@ -469,14 +469,14 @@
     }
     if (data.type === 'blocked-link') {
       api.status?.(
-        typeof window.t === 'function' ? window.t('remote.linkStillBlocked') : 'Ce lien reste bloqué tant qu’il n’est pas autorisé.',
+        typeof window.t === 'function' ? window.t('remote.linkStillBlocked') : 'Dieser Link bleibt blockiert, bis er zugelassen wird.',
         'error',
       );
       return;
     }
     if (data.type === 'invalid-link' || !url) {
       api.status?.(
-        typeof window.t === 'function' ? window.t('link.blockedInvalid') : 'Lien invalide ou bloqué.',
+        typeof window.t === 'function' ? window.t('link.blockedInvalid') : 'Ungültiger oder blockierter Link.',
         'error',
       );
       return;
