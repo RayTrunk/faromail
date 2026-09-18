@@ -1112,13 +1112,7 @@ const App = (() => {
   };
 
   function applyAppVersion() {
-    const rawVersion = String(window.NL_APPVERSION || '0.4.3').replace(/^v/i, '');
-    const badge = document.getElementById('app-version');
-    if (badge) {
-      badge.textContent = `v${rawVersion}`;
-      badge.title = t('app.version', { version: rawVersion });
-    }
-    document.title = `FARO Mail ${rawVersion}`;
+    document.title = 'FARO Mail';
   }
 
   function applySidebarSectionState(name) {
