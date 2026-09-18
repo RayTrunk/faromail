@@ -24,7 +24,7 @@ if not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", version):
 checks = {
     "VERSION": ROOT / "VERSION",
     "README.md": ROOT / "README.md",
-    "resources/index.html": ROOT / "resources/index.html",
+    "resources/js/app.js": ROOT / "resources/js/app.js",
     "engine/backend.js": ROOT / "engine/backend.js",
 }
 
@@ -39,9 +39,13 @@ readme = checks["README.md"].read_text(encoding="utf-8")
 if f"version-{version}-" not in readme:
     fail("le badge de version du README n'est pas synchronisé.")
 
-html = checks["resources/index.html"].read_text(encoding="utf-8")
-if version not in html:
-    fail("resources/index.html ne contient pas la version courante.")
+# La version n'apparaît plus dans resources/index.html depuis que le titre de
+# fenêtre et le badge de la barre supérieure ont volontairement été débarrassés
+# du numéro de version : elle ne reste que comme repli JS (window.NL_APPVERSION
+# indisponible, ex. build de développement) pour la boîte de dialogue « À propos ».
+app_js = checks["resources/js/app.js"].read_text(encoding="utf-8")
+if not re.search(rf"NL_APPVERSION\s*\|\|\s*['\"]{re.escape(version)}['\"]", app_js):
+    fail("resources/js/app.js ne contient pas le repli de version courant.")
 
 backend = checks["engine/backend.js"].read_text(encoding="utf-8")
 backend_patterns = [
