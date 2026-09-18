@@ -6870,7 +6870,7 @@ const App = (() => {
 
   // ---------- Mise à jour et À propos ----------
   function appVersion() {
-    return String(window.NL_APPVERSION || '0.4.3').replace(/^v/i, '');
+    return String(window.NL_APPVERSION || '0.4.9').replace(/^v/i, '');
   }
 
   function compareVersions(a, b) {

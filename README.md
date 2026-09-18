@@ -2,7 +2,7 @@
 
 <p align="center"><img src="resources/assets/faromail-logo.svg" alt="FARO Mail" width="220"></p>
 
-[![Version](https://img.shields.io/badge/version-0.4.3-4f8bd8)](https://github.com/RayTrunk/faromail/releases)
+[![Version](https://img.shields.io/badge/version-0.4.9-4f8bd8)](https://github.com/RayTrunk/faromail/releases)
 [![Verification](https://github.com/RayTrunk/faromail/actions/workflows/verify.yml/badge.svg)](https://github.com/RayTrunk/faromail/actions/workflows/verify.yml)
 [![Builds](https://github.com/RayTrunk/faromail/actions/workflows/build.yml/badge.svg)](https://github.com/RayTrunk/faromail/actions/workflows/build.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)

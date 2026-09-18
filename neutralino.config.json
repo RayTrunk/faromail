@@ -1,6 +1,6 @@
 {
   "applicationId": "eu.faromail.app",
-  "version": "0.4.3",
+  "version": "0.4.9",
   "defaultMode": "window",
   "port": 0,
   "documentRoot": "/resources/",

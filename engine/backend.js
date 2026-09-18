@@ -39,7 +39,7 @@ const certTrust = require('./lib/cert_trust');
 const mailRules = require('./lib/mail_rules');
 
 const PORT = 47800;
-const APP_VERSION = '0.4.3';
+const APP_VERSION = '0.4.9';
 const ROOT = path.resolve(__dirname, '..');
 const DATA = path.join(ROOT, 'data');
 const ACCOUNTS_FILE = path.join(DATA, 'accounts.json');

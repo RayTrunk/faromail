@@ -17,7 +17,6 @@ version = sys.argv[1]
 config_path = ROOT / "neutralino.config.json"
 config = json.loads(config_path.read_text(encoding="utf-8"))
 config["version"] = version
-config.setdefault("modes", {}).setdefault("window", {})["title"] = f"FARO Mail {version}"
 config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 (ROOT / "VERSION").write_text(version + "\n", encoding="utf-8")

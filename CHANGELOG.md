@@ -1,3 +1,45 @@
+# FARO Mail 0.4.9 - 2026-09-19
+
+FARO Mail 0.4.9 packages a Windows installer alongside the portable build,
+fixes a security issue in the sender-icon fetcher, and finishes translating
+the interface (several messages were still hardcoded in French).
+
+## Security
+
+- Fixed an SSRF issue in the sender-icon fetcher (`icon_cache.js`): a sender's
+  mail server could redirect the outgoing favicon request to an internal
+  address. Redirects are now re-validated against the private-network
+  blocklist at every hop instead of only on the initial request.
+
+## Fixes
+
+- The bundled Windows engine could occasionally fail to start on the very
+  first launch after installation; the connection-wait timeout was increased
+  and startup diagnostics (`data\engine-startup.log`) now survive an app
+  restart instead of being overwritten by the next attempt.
+- Printing a message with a PDF attachment open printed both the PDF and the
+  underlying message; the print stylesheet now only prints the active view.
+- Several backend error messages (account setup validation, "not found",
+  "sync already running") were sent to the interface as raw French text
+  instead of being translated; the most frequent ones are now translated,
+  and any future backend error carrying an error code is translated
+  automatically wherever it is displayed.
+- A handful of remaining hardcoded French strings in the interface (engine
+  startup failure message, a few accessibility labels) are now translated.
+
+## Changed
+
+- New application icon and in-app logo (envelope with a lighthouse).
+- The window title and topbar no longer show the version number next to
+  "FARO Mail"; the version remains visible in the About dialog.
+- Account setup now shows a hint (with a direct link) when the email domain
+  is Gmail or iCloud, since both require an app-specific password instead of
+  the regular account password.
+- Windows package now also ships as an installer (Inno Setup), in addition
+  to the existing portable ZIP.
+
+---
+
 # FARO Mail 0.4.3 - 2026-08-21
 
 FARO Mail 0.4.3 est une version corrective qui rétablit le glisser-déposer des pièces jointes dans la fenêtre de rédaction.
