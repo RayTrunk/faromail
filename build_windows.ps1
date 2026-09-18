@@ -345,7 +345,7 @@ try {
     $patchedConfig.modes.window | Add-Member `
         -MemberType NoteProperty `
         -Name title `
-        -Value "FARO Mail $Version" `
+        -Value "FARO Mail" `
         -Force
 
     if ((-not ($patchedConfig.PSObject.Properties.Name -contains 'globalVariables')) -or (-not $patchedConfig.globalVariables)) {
