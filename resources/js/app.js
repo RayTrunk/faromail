@@ -13,6 +13,7 @@ const App = (() => {
   let bundledEngineLastError = '';
   let bundledEngineEventsWired = false;
   let bundledEngineStartupLog = [];
+  let bundledEngineStartupLogSeeded = false;
   let lastProbeFailureDetail = '';
   const pending = new Map();
 
@@ -206,11 +207,25 @@ const App = (() => {
       const appDir = String(window.NL_PATH || '').replace(/[\\/]+$/, '');
       if (!appDir) return;
       await Neutralino.filesystem.createDirectory(`${appDir}\\data`).catch(() => {});
-      if (reset) bundledEngineStartupLog = [];
+      const logPath = `${appDir}\\data\\engine-startup.log`;
+      // Ce tampon vit en mémoire JS : il repart forcément à zéro à chaque
+      // relance complète de l'appli. Sans relire l'ancien fichier ici, un
+      // lancement qui reste bloqué puis une seconde tentative qui réussit
+      // écraseraient la trace du blocage avant qu'on ait pu la consulter —
+      // exactement le scénario « ça ne démarre pas, je referme et rouvre ».
+      if (!bundledEngineStartupLogSeeded) {
+        bundledEngineStartupLogSeeded = true;
+        try {
+          const existing = await Neutralino.filesystem.readFile(logPath);
+          const previousLines = String(existing || '').split('\n').filter(Boolean);
+          if (previousLines.length) bundledEngineStartupLog = previousLines.slice(-160);
+        } catch {}
+      }
+      if (reset) bundledEngineStartupLog.push('────────── Nouveau lancement ──────────');
       const stamp = new Date().toISOString();
       bundledEngineStartupLog.push(`[${stamp}] ${String(message || '')}`);
-      if (bundledEngineStartupLog.length > 80) bundledEngineStartupLog = bundledEngineStartupLog.slice(-80);
-      await Neutralino.filesystem.writeFile(`${appDir}\\data\\engine-startup.log`, `${bundledEngineStartupLog.join('\n')}\n`);
+      if (bundledEngineStartupLog.length > 160) bundledEngineStartupLog = bundledEngineStartupLog.slice(-160);
+      await Neutralino.filesystem.writeFile(logPath, `${bundledEngineStartupLog.join('\n')}\n`);
     } catch {}
   }
 
