@@ -13,6 +13,8 @@ accounts without requiring Node.js to be installed on the target computer.
 
 Currently released for **Windows only**.
 
+![FARO Mail main window](docs/screenshots/faromail-main.png)
+
 ## Highlights
 
 - Multiple IMAP and SMTP accounts with a unified inbox
