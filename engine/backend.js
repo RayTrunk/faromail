@@ -465,7 +465,7 @@ function accountFoldersChanged(account, map) {
 }
 
 async function ensureFolderMap(account, { force = false, signal = null } = {}) {
-  if (!account) throw new Error('Compte introuvable');
+  if (!account) throw validationError('ACCOUNT_NOT_FOUND', 'Compte introuvable');
   if (account.receiveProtocol === 'pop3') return account.folderMap || { inbox: 'INBOX', sent: 'Local/Sent', trash: 'Local/Trash', junk: 'Local/Junk' };
   const hasUsefulMap = account.folderMap?.inbox
     && (account.folderMap.sent || account.folderMap.trash || account.folderMap.junk);
@@ -501,7 +501,7 @@ function publicAccount(account) {
 }
 
 function accountDetails(account) {
-  if (!account) throw new Error('Compte introuvable');
+  if (!account) throw validationError('ACCOUNT_NOT_FOUND', 'Compte introuvable');
   const protocol = account.receiveProtocol || 'imap';
   const incomingPassword = protocol === 'pop3' ? account.pop3?.pass : account.imap?.pass;
   return {
@@ -582,23 +582,27 @@ function carriedCertFingerprint(inputProtocol, currentProtocol, nextHost, nextPo
   return sameTarget ? String(currentProtocol?.trustedCertFingerprint || '') : '';
 }
 
+function validationError(code, message) {
+  return Object.assign(new Error(message), { code });
+}
+
 function validateAccountInput(input, existingId = null) {
   const email = String(input.email || '').trim();
-  if (!email) throw new Error('Adresse e-mail obligatoire');
+  if (!email) throw validationError('ACCOUNT_EMAIL_REQUIRED', 'Adresse e-mail obligatoire');
   if (accounts.some(account => account.id !== existingId
       && String(account.email || '').toLowerCase() === email.toLowerCase())) {
-    throw new Error('Un compte utilise déjà cette adresse e-mail');
+    throw validationError('ACCOUNT_EMAIL_DUPLICATE', 'Un compte utilise déjà cette adresse e-mail');
   }
   const protocol = String(input.receiveProtocol || 'imap').toLowerCase() === 'pop3' ? 'pop3' : 'imap';
   if (protocol === 'pop3') {
-    if (!String(input.pop3?.host || '').trim()) throw new Error('Serveur POP3 obligatoire');
-    if (!String(input.pop3?.user || '').trim()) throw new Error('Identifiant POP3 obligatoire');
-    if (input.pop3?.secure === false) throw new Error('POP3 doit utiliser SSL/TLS dans FARO Mail');
+    if (!String(input.pop3?.host || '').trim()) throw validationError('ACCOUNT_POP3_HOST_REQUIRED', 'Serveur POP3 obligatoire');
+    if (!String(input.pop3?.user || '').trim()) throw validationError('ACCOUNT_POP3_USER_REQUIRED', 'Identifiant POP3 obligatoire');
+    if (input.pop3?.secure === false) throw validationError('ACCOUNT_POP3_TLS_REQUIRED', 'POP3 doit utiliser SSL/TLS dans FARO Mail');
   } else {
-    if (!String(input.imap?.host || '').trim()) throw new Error('Serveur IMAP obligatoire');
-    if (!String(input.imap?.user || '').trim()) throw new Error('Identifiant IMAP obligatoire');
+    if (!String(input.imap?.host || '').trim()) throw validationError('ACCOUNT_IMAP_HOST_REQUIRED', 'Serveur IMAP obligatoire');
+    if (!String(input.imap?.user || '').trim()) throw validationError('ACCOUNT_IMAP_USER_REQUIRED', 'Identifiant IMAP obligatoire');
   }
-  if (!String(input.smtp?.host || '').trim()) throw new Error('Serveur SMTP obligatoire');
+  if (!String(input.smtp?.host || '').trim()) throw validationError('ACCOUNT_SMTP_HOST_REQUIRED', 'Serveur SMTP obligatoire');
 }
 
 function isCalendarAttachment(attachment = {}) {
@@ -617,7 +621,7 @@ function calendarAttachmentFilename(attachment = {}, index = 0) {
 }
 
 function localMessagePath(message, { mustExist = true } = {}) {
-  if (!message) throw new Error('Message introuvable');
+  if (!message) throw validationError('MESSAGE_NOT_FOUND', 'Message introuvable');
   if (String(message.storage_kind || '') === 'encrypted') return '';
   const resolved = db.resolveEmlPath(DATA, message);
   if (mustExist && (!resolved || !fs.existsSync(resolved))) {
@@ -759,7 +763,7 @@ async function waitForStoppingSyncs() {
     .filter(([, meta]) => !meta.cancelRequestedAt)
     .map(([accountId]) => accountId);
   if (running.length) {
-    throw new Error('Une relève est en cours. Arrêtez-la avant cette opération.');
+    throw validationError('SYNC_BUSY_STOP_FIRST', 'Une relève est en cours. Arrêtez-la avant cette opération.');
   }
 
   // Si l'utilisateur vient de cliquer sur Arrêter, laisser le watchdog 0.4.2
@@ -767,7 +771,7 @@ async function waitForStoppingSyncs() {
   const deadline = Date.now() + SYNC_CANCEL_WATCHDOG_MS + 1200;
   while (activeSyncMeta.size && Date.now() < deadline) await waitMs(100);
   if (activeSyncMeta.size) {
-    throw new Error('La relève est encore en cours d’arrêt. Réessayez dans quelques secondes.');
+    throw validationError('SYNC_STOPPING', 'La relève est encore en cours d’arrêt. Réessayez dans quelques secondes.');
   }
 }
 
@@ -790,7 +794,7 @@ async function withFolderMaintenance(kind, task) {
 
 
 async function syncAccount(account, source = 'manual') {
-  if (!account) throw new Error('Compte introuvable');
+  if (!account) throw validationError('ACCOUNT_NOT_FOUND', 'Compte introuvable');
   if (folderMaintenanceOperation) {
     if (source === 'manual') {
       throw new Error('Une opération sur les dossiers est en cours. Réessayez lorsqu’elle est terminée.');
@@ -1734,7 +1738,7 @@ function ensureMaintenanceAvailable() {
   if (maintenanceOperation) throw new Error('Une opération de sauvegarde ou de restauration est déjà en cours');
   if (folderMaintenanceOperation) throw new Error('Une opération de maintenance des dossiers est en cours');
   if (activeSyncs.size) {
-    throw new Error('Une relève est en cours. Réessayez lorsqu’elle est terminée.');
+    throw validationError('SYNC_BUSY', 'Une relève est en cours. Réessayez lorsqu’elle est terminée.');
   }
 }
 
@@ -2249,8 +2253,8 @@ const methods = {
 
   'accounts.update': async input => {
     const current = getAccount(input.id);
-    if (!current) throw new Error('Compte introuvable');
-    if (activeSyncs.has(current.id)) throw new Error('Une relève est en cours pour ce compte. Réessayez dans quelques instants.');
+    if (!current) throw validationError('ACCOUNT_NOT_FOUND', 'Compte introuvable');
+    if (activeSyncs.has(current.id)) throw validationError('SYNC_ACCOUNT_BUSY', 'Une relève est en cours pour ce compte. Réessayez dans quelques instants.');
     validateAccountInput(input, current.id);
 
     const receiveProtocol = String(input.receiveProtocol || current.receiveProtocol || 'imap').toLowerCase() === 'pop3' ? 'pop3' : 'imap';
@@ -2330,8 +2334,8 @@ const methods = {
 
   'accounts.remove': async ({ id }) => {
     const account = getAccount(id);
-    if (!account) throw new Error('Compte introuvable');
-    if (activeSyncs.has(id)) throw new Error('Une relève est en cours pour ce compte. Réessayez dans quelques instants.');
+    if (!account) throw validationError('ACCOUNT_NOT_FOUND', 'Compte introuvable');
+    if (activeSyncs.has(id)) throw validationError('SYNC_ACCOUNT_BUSY', 'Une relève est en cours pour ce compte. Réessayez dans quelques instants.');
     imap.stopWatch(id);
     const timer = syncTimers.get(id);
     if (timer) clearInterval(timer);
@@ -2363,7 +2367,7 @@ const methods = {
 
   'accounts.setSyncInterval': async ({ id, minutes }) => {
     const account = getAccount(id);
-    if (!account) throw new Error('Compte introuvable');
+    if (!account) throw validationError('ACCOUNT_NOT_FOUND', 'Compte introuvable');
     account.syncIntervalMinutes = Math.max(0, Math.min(1440, Math.round(Number(minutes) || 0)));
     saveAccounts();
     scheduleAccount(account);
@@ -2372,7 +2376,7 @@ const methods = {
 
   'accounts.setSpamRetention': async ({ id, days }) => {
     const account = getAccount(id);
-    if (!account) throw new Error('Compte introuvable');
+    if (!account) throw validationError('ACCOUNT_NOT_FOUND', 'Compte introuvable');
     account.spamRetentionDays = Math.max(0, Math.min(3650, Math.round(Number(days) || 0)));
     saveAccounts();
     cleanupExpiredSpamForAccount(account, { source: 'settings', silent: true }).catch(() => {});
@@ -2381,7 +2385,7 @@ const methods = {
 
   'accounts.setExtraFolders': async ({ id, folders }) => {
     const account = getAccount(id);
-    if (!account) throw new Error('Compte introuvable');
+    if (!account) throw validationError('ACCOUNT_NOT_FOUND', 'Compte introuvable');
     if (account.receiveProtocol === 'pop3') throw new Error('POP3 ne prend pas en charge les dossiers supplémentaires');
     const list = Array.isArray(folders) ? folders : [];
     account.extraFolders = [...new Set(list.map(folder => String(folder || '').trim()).filter(Boolean))].slice(0, 50);
@@ -2392,7 +2396,7 @@ const methods = {
 
   'accounts.setAliases': async ({ id, aliases }) => {
     const account = getAccount(id);
-    if (!account) throw new Error('Compte introuvable');
+    if (!account) throw validationError('ACCOUNT_NOT_FOUND', 'Compte introuvable');
     const list = Array.isArray(aliases) ? aliases : [];
     account.aliases = list.map(normalizeAliasEntry).filter(Boolean).slice(0, 20);
     saveAccounts();
@@ -2401,7 +2405,7 @@ const methods = {
 
   'accounts.folders': async ({ id }) => {
     const account = getAccount(id);
-    if (!account) throw new Error('Compte introuvable');
+    if (!account) throw validationError('ACCOUNT_NOT_FOUND', 'Compte introuvable');
     if (account.receiveProtocol === 'pop3') return [
       { path: 'INBOX', name: 'INBOX', specialUse: '\\Inbox' },
       { path: 'Local/Sent', name: 'Envoyés', specialUse: '\\Sent' },
@@ -2420,7 +2424,7 @@ const methods = {
   // relève est acceptée. L'interface suit ensuite l'état réel via sync.*.
   'sync.start': async ({ accountId }) => {
     const account = getAccount(String(accountId || ''));
-    if (!account) throw new Error('Compte introuvable');
+    if (!account) throw validationError('ACCOUNT_NOT_FOUND', 'Compte introuvable');
     const existing = activeSyncMeta.get(account.id);
     if (existing) {
       return { started: false, alreadyRunning: true, accountId: account.id, runId: existing.runId };
@@ -2498,7 +2502,7 @@ const methods = {
   }),
   'messages.read': async ({ id }) => {
     const message = db.getMessage(id);
-    if (!message) throw new Error('Message introuvable');
+    if (!message) throw validationError('MESSAGE_NOT_FOUND', 'Message introuvable');
     const raw = readLocalMessage(message);
     const parsed = await tnef.expandTnefAttachments(await simpleParser(raw));
     const outgoing = message.folder_role === 'sent';
@@ -2552,7 +2556,7 @@ const methods = {
   // ---------- Actions ----------
   'messages.setFlag': async ({ id, flag, value }) => {
     const message = db.getMessage(id);
-    if (!message) throw new Error('Message introuvable');
+    if (!message) throw validationError('MESSAGE_NOT_FOUND', 'Message introuvable');
     db.setFlag(id, flag, value);
     serverActionSafe(message, { type: value ? flag : 'un' + flag });
     return true;
@@ -2571,7 +2575,7 @@ const methods = {
   },
   'messages.markSpam': async ({ id, isSpam }) => {
     const message = db.getMessage(id);
-    if (!message) throw new Error('Message introuvable');
+    if (!message) throw validationError('MESSAGE_NOT_FOUND', 'Message introuvable');
     await setMessageSpamState(message, Boolean(isSpam), { persistSenderRule: Boolean(isSpam) });
     return spam.stats();
   },
@@ -2649,7 +2653,7 @@ const methods = {
   'rules.reorder': async ({ accountId, orderedIds }) => db.reorderMailRules(accountId, orderedIds),
   'rules.applyToExisting': async ({ accountId }) => {
     const account = getAccount(accountId);
-    if (!account) throw new Error('Compte introuvable');
+    if (!account) throw validationError('ACCOUNT_NOT_FOUND', 'Compte introuvable');
     const inboxRows = db.listMessages({ accountId: account.id, folderRole: 'inbox', spam: null, limit: 5000 });
     const ids = inboxRows.map(row => row.id);
     await applyMailRulesForNewMessages(account, account.folderMap?.inbox || 'INBOX', ids);
@@ -2711,7 +2715,7 @@ const methods = {
   },
   'contacts.addFromMessage': async ({ messageId, trusted = true }) => {
     const message = db.getMessage(messageId);
-    if (!message) throw new Error('Message introuvable');
+    if (!message) throw validationError('MESSAGE_NOT_FOUND', 'Message introuvable');
     const outgoing = message.folder_role === 'sent';
     const email = outgoing
       ? String(message.to_addr || '').split(',').map(value => value.trim()).find(Boolean)
@@ -2796,11 +2800,11 @@ const methods = {
   },
   'calendar.importAttachment': async ({ messageId, index } = {}) => {
     const message = db.getMessage(messageId);
-    if (!message) throw new Error('Message introuvable');
+    if (!message) throw validationError('MESSAGE_NOT_FOUND', 'Message introuvable');
     const parsedMessage = await tnef.expandTnefAttachments(await simpleParser(readLocalMessage(message)));
     const attachmentIndex = Number(index);
     const attachment = (parsedMessage.attachments || [])[attachmentIndex];
-    if (!attachment) throw new Error('Pièce jointe introuvable');
+    if (!attachment) throw validationError('ATTACHMENT_NOT_FOUND', 'Pièce jointe introuvable');
     if (!isCalendarAttachment(attachment)) throw new Error('Cette pièce jointe n’est pas un calendrier compatible');
 
     const text = Buffer.isBuffer(attachment.content)
@@ -2917,10 +2921,10 @@ const methods = {
       throw new Error('Emplacement de fichier non autorisé');
     }
     const message = db.getMessage(messageId);
-    if (!message) throw new Error('Message introuvable');
+    if (!message) throw validationError('MESSAGE_NOT_FOUND', 'Message introuvable');
     const parsed = await tnef.expandTnefAttachments(await simpleParser(readLocalMessage(message)));
     const attachment = (parsed.attachments || [])[index];
-    if (!attachment) throw new Error('Pièce jointe introuvable');
+    if (!attachment) throw validationError('ATTACHMENT_NOT_FOUND', 'Pièce jointe introuvable');
     fs.writeFileSync(resolvedTarget, attachment.content);
     return { saved: resolvedTarget, size: attachment.size };
   },
@@ -2932,10 +2936,10 @@ const methods = {
   'attachments.read': async ({ messageId, index }) => {
     const MAX_PREVIEW_BYTES = 40 * 1024 * 1024;
     const message = db.getMessage(messageId);
-    if (!message) throw new Error('Message introuvable');
+    if (!message) throw validationError('MESSAGE_NOT_FOUND', 'Message introuvable');
     const parsed = await tnef.expandTnefAttachments(await simpleParser(readLocalMessage(message)));
     const attachment = (parsed.attachments || [])[index];
-    if (!attachment) throw new Error('Pièce jointe introuvable');
+    if (!attachment) throw validationError('ATTACHMENT_NOT_FOUND', 'Pièce jointe introuvable');
     if (attachment.size > MAX_PREVIEW_BYTES) {
       throw new Error('Fichier trop volumineux pour un aperçu intégré (> 40 Mo). Enregistrez-le puis ouvrez-le avec une application externe.');
     }

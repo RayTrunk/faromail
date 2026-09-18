@@ -440,11 +440,17 @@ const App = (() => {
       const request = pending.get(message.id);
       if (!request) return;
       pending.delete(message.id);
-      message.ok ? request.resolve(message.result) : request.reject(Object.assign(new Error(message.error), {
+      if (message.ok) { request.resolve(message.result); return; }
+      // Traduit ici, une seule fois, plutôt que dans chacun des nombreux
+      // blocs catch qui affichent ensuite error.message tel quel : ceux-ci
+      // profitent de la traduction sans être modifiés un par un.
+      const errorObject = Object.assign(new Error(message.error), {
         code: message.errorCode || '',
         protocol: message.errorProtocol || '',
         certDetails: message.certDetails || null,
-      }));
+      });
+      errorObject.message = translateRpcError(errorObject);
+      request.reject(errorObject);
     };
   }
 
@@ -470,6 +476,21 @@ const App = (() => {
     CONNECTION_RESET: 'account.error.connectionReset',
     AUTH_FAILED: 'account.error.authFailed',
     CERT_UNTRUSTED: 'account.error.certUntrusted',
+    ACCOUNT_EMAIL_REQUIRED: 'error.accountEmailRequired',
+    ACCOUNT_EMAIL_DUPLICATE: 'error.accountEmailDuplicate',
+    ACCOUNT_POP3_HOST_REQUIRED: 'error.accountPop3HostRequired',
+    ACCOUNT_POP3_USER_REQUIRED: 'error.accountPop3UserRequired',
+    ACCOUNT_POP3_TLS_REQUIRED: 'error.accountPop3TlsRequired',
+    ACCOUNT_IMAP_HOST_REQUIRED: 'error.accountImapHostRequired',
+    ACCOUNT_IMAP_USER_REQUIRED: 'error.accountImapUserRequired',
+    ACCOUNT_SMTP_HOST_REQUIRED: 'error.accountSmtpHostRequired',
+    ACCOUNT_NOT_FOUND: 'error.accountNotFound',
+    MESSAGE_NOT_FOUND: 'error.messageNotFound',
+    ATTACHMENT_NOT_FOUND: 'error.attachmentNotFound',
+    SYNC_ACCOUNT_BUSY: 'error.syncAccountBusy',
+    SYNC_BUSY: 'error.syncBusy',
+    SYNC_BUSY_STOP_FIRST: 'error.syncBusyStopFirst',
+    SYNC_STOPPING: 'error.syncStopping',
   };
   function translateRpcError(error) {
     const key = RPC_ERROR_KEYS[error?.code];
