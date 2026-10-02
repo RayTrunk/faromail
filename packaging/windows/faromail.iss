@@ -3,7 +3,7 @@
 ; (dossier build\windows\FaroMail-{#AppVersion}-windows-x86_64).
 ; Compilation : ISCC.exe packaging\windows\faromail.iss
 
-#define AppVersion "0.4.9"
+#define AppVersion "0.4.10"
 #define SourceDir "..\..\build\windows\FaroMail-" + AppVersion + "-windows-x86_64"
 
 [Setup]

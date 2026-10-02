@@ -1,3 +1,16 @@
+# FARO Mail 0.4.10 - 2026-10-02
+
+## Fixes
+
+- Printing a multi-page PDF attachment only printed its first page.
+  `html`/`body` (`height: 100%; overflow: hidden`) and `#app` (`height: 100vh`)
+  were never reset for print, so the PDF viewer's content was clipped to one
+  screen's height before print pagination could lay it out across pages.
+  Printing a message was unaffected, since the message body renders inside an
+  `<iframe>` with its own document context.
+
+---
+
 # FARO Mail 0.4.9 - 2026-09-19
 
 FARO Mail 0.4.9 packages a Windows installer alongside the portable build,
