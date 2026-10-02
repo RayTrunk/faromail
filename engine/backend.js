@@ -13,6 +13,7 @@ try {
   require('module').enableCompileCache(path.join(__dirname, '..', 'data', '.compile-cache'));
 } catch {}
 const fs = require('fs');
+const os = require('os');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 const { WebSocketServer } = require('ws');
@@ -2033,6 +2034,60 @@ async function checkLatestRelease() {
   }
 }
 
+async function findLatestReleaseAsset(nameTest) {
+  const endpoint = 'https://api.github.com/repos/RayTrunk/faromail/releases/latest';
+  const response = await fetch(endpoint, {
+    headers: {
+      Accept: 'application/vnd.github+json',
+      'User-Agent': `FARO Mail/${APP_VERSION}`,
+    },
+  });
+  if (!response.ok) throw new Error(`GitHub ${response.status}`);
+  const payload = await response.json();
+  const assets = Array.isArray(payload.assets) ? payload.assets : [];
+  const asset = assets.find(item => nameTest.test(String(item.name || '')));
+  if (!asset) throw new Error('Aucun installeur Windows trouvé dans la dernière version publiée.');
+  return asset;
+}
+
+let updateDownloadInProgress = false;
+
+/**
+ * Télécharge le dernier installeur Windows publié sur GitHub et le lance.
+ * L'URL de téléchargement provient toujours de l'API GitHub du dépôt fixe
+ * (jamais d'une entrée fournie par l'appelant) : il ne s'agit donc pas d'un
+ * SSRF, contrairement à une URL arbitraire. Vérifie la taille annoncée par
+ * GitHub pour détecter un téléchargement tronqué ; FaroMail.exe se ferme
+ * ensuite côté interface pour laisser l'installeur remplacer les fichiers.
+ */
+async function downloadAndLaunchUpdate() {
+  if (updateDownloadInProgress) throw new Error('Un téléchargement de mise à jour est déjà en cours.');
+  updateDownloadInProgress = true;
+  try {
+    const asset = await findLatestReleaseAsset(/Setup\.exe$/i);
+    const targetDir = path.join(os.tmpdir(), 'FaroMail-update');
+    fs.mkdirSync(targetDir, { recursive: true });
+    const targetPath = path.join(targetDir, asset.name);
+
+    const response = await fetch(asset.browser_download_url, {
+      headers: { 'User-Agent': `FARO Mail/${APP_VERSION}` },
+      redirect: 'follow',
+    });
+    if (!response.ok) throw new Error(`Téléchargement de l'installeur impossible (HTTP ${response.status})`);
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (Number(asset.size) > 0 && buffer.length !== Number(asset.size)) {
+      throw new Error('Fichier téléchargé incomplet ou corrompu (taille inattendue).');
+    }
+    fs.writeFileSync(targetPath, buffer);
+
+    const child = spawn(targetPath, [], { detached: true, stdio: 'ignore', windowsHide: false });
+    child.unref();
+    return { launched: true, path: targetPath, name: asset.name };
+  } finally {
+    updateDownloadInProgress = false;
+  }
+}
+
 async function sendMailNow(accountId, mail) {
   const account = getAccount(accountId || config.defaultAccountId);
   if (!account) throw new Error('Aucun compte expéditeur');
@@ -3010,6 +3065,16 @@ const methods = {
 
   // ---------- Version ----------
   'app.checkLatestVersion': async () => checkLatestRelease(),
+  'app.downloadUpdate': async () => downloadAndLaunchUpdate(),
+
+  // ---------- Instance unique ----------
+  // Une seconde fenêtre qui détecte ce moteur déjà actif appelle cette
+  // méthode puis se ferme elle-même : ce message redonne le focus à la
+  // fenêtre existante plutôt que de laisser deux fenêtres ouvertes.
+  'app.focusMainWindow': async () => {
+    broadcast('app.focusRequested', {});
+    return true;
+  },
 
   // ---------- Arrêt ----------
   'app.shutdown': async () => {

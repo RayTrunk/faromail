@@ -319,14 +319,45 @@ const App = (() => {
     }
   }
 
+  // Connexion ponctuelle et isolée (hors du canal RPC principal) pour
+  // demander à l'instance déjà active de reprendre le focus avant que
+  // celle-ci ne se ferme.
+  function requestFocusOnRunningInstance() {
+    return new Promise(resolve => {
+      let settled = false;
+      const finish = () => { if (!settled) { settled = true; resolve(); } };
+      let socket = null;
+      const timer = setTimeout(finish, 1500);
+      try {
+        socket = new WebSocket(engineUrl());
+        socket.onopen = () => {
+          try { socket.send(JSON.stringify({ id: 1, method: 'app.focusMainWindow', params: {} })); }
+          catch { clearTimeout(timer); finish(); }
+        };
+        socket.onmessage = () => { clearTimeout(timer); try { socket.close(); } catch {} finish(); };
+        socket.onerror = () => { clearTimeout(timer); finish(); };
+        socket.onclose = () => { clearTimeout(timer); finish(); };
+      } catch {
+        clearTimeout(timer);
+        finish();
+      }
+    });
+  }
+
   async function ensureBundledWindowsEngine() {
     if (!usesBundledWindowsEngine()) return;
     startupMessage(t('startup.engineInit'));
     wireBundledEngineEvents();
 
-    // Une instance précédente peut déjà fournir le moteur. Dans ce cas, cette
-    // fenêtre s'y connecte mais n'en devient pas propriétaire.
-    if (await probeEngine(250)) return;
+    // Une instance précédente peut déjà fournir le moteur : FARO Mail ne doit
+    // s'exécuter qu'une seule fois. Plutôt que d'ouvrir une seconde fenêtre
+    // partageant le même moteur, on redonne le focus à la fenêtre existante
+    // et on ferme cette nouvelle instance.
+    if (await probeEngine(250)) {
+      await requestFocusOnRunningInstance();
+      await Neutralino.app.exit();
+      return;
+    }
 
     const appDir = String(window.NL_PATH || '').replace(/[\\/]+$/, '');
     if (!appDir || appDir.includes('"')) throw new Error('Chemin d’installation FARO Mail invalide.');
@@ -932,7 +963,9 @@ const App = (() => {
   function onEvent(event, data) {
     window.OutboxUI?.onEngineEvent?.(event, data);
     window.PlannerUI?.onEngineEvent?.(event, data);
-    if (event === 'sync.started') {
+    if (event === 'app.focusRequested') {
+      Neutralino.window.focus().catch(() => {});
+    } else if (event === 'sync.started') {
       beginSyncActivity(data);
       status(t('status.syncStarting', { account: accountLabel(data.accountId) }), 'busy');
     } else if (event === 'sync.progress') {
@@ -6903,6 +6936,11 @@ const App = (() => {
       button.disabled = updateState.checking;
       button.classList.toggle('is-checking', updateState.checking);
     }
+    const installButton = document.getElementById('btn-install-update');
+    if (installButton) {
+      installButton.classList.toggle('hidden', !updateState.available || updateState.installing);
+      installButton.disabled = Boolean(updateState.installing);
+    }
     if (!state || !details) return;
     if (updateState.checking) {
       state.innerHTML = `<i class="fa-solid fa-rotate fa-spin"></i><strong>${esc(t('update.checking'))}</strong>`;
@@ -8408,6 +8446,21 @@ const App = (() => {
     });
     document.getElementById('update-notice')?.addEventListener('click', openAboutModal);
     document.getElementById('btn-check-update')?.addEventListener('click', () => checkForUpdates(true));
+    document.getElementById('btn-install-update')?.addEventListener('click', async () => {
+      if (updateState.installing) return;
+      updateState = { ...updateState, installing: true };
+      renderUpdateStatus();
+      status(t('update.downloading'), 'busy');
+      try {
+        await rpc('app.downloadUpdate');
+        status(t('update.installingRestart'), 'success');
+        setTimeout(() => { Neutralino.app.exit().catch(() => {}); }, 1200);
+      } catch (error) {
+        updateState = { ...updateState, installing: false };
+        renderUpdateStatus();
+        status(`${t('error')} : ${error.message}`, 'error');
+      }
+    });
     document.getElementById('set-signature-account').onchange = event => loadSignatureEditor(event.target.value);
     document.getElementById('btn-save-signature').onclick = saveSignatureSettings;
     [
