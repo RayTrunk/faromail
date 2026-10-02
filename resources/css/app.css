@@ -4336,7 +4336,8 @@ html[data-theme="sagasser"] #reader-empty.reader-empty-brand .reader-empty-logo-
   #remote-banner, .modal-veil, .att-calendar-add, .att-calendar-state {
     display: none !important;
   }
-  #app { display: block; }
+  html, body { height: auto !important; overflow: visible !important; }
+  #app { display: block; height: auto !important; overflow: visible !important; }
   #reader { display: block; width: 100%; height: auto; }
   #reader-content:not(.hidden) { display: block !important; height: auto; }
   #reader-head { border-bottom: 1px solid #999; padding: 0 0 10px; }
